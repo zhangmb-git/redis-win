@@ -28,10 +28,6 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef _WIN32
-#include "../../src/Win32_Interop/Win32_Portability.h"
-#endif
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,10 +85,10 @@ static void _intsetSet(intset *is, int pos, int64_t value) {
         ((int64_t*)is->contents)[pos] = value;
         memrev64ifbe(((int64_t*)is->contents)+pos);
     } else if (encoding == INTSET_ENC_INT32) {
-        ((int32_t*)is->contents)[pos] = (int32_t)value;                     WIN_PORT_FIX /* cast (int32_t) */
+        ((int32_t*)is->contents)[pos] = value;
         memrev32ifbe(((int32_t*)is->contents)+pos);
     } else {
-        ((int16_t*)is->contents)[pos] = (int16_t)value;                     WIN_PORT_FIX /* cast (int16_t) */
+        ((int16_t*)is->contents)[pos] = value;
         memrev16ifbe(((int16_t*)is->contents)+pos);
     }
 }
@@ -127,7 +123,7 @@ static uint8_t intsetSearch(intset *is, int64_t value, uint32_t *pos) {
     } else {
         /* Check for the case where we know we cannot find the value,
          * but do know the insert position. */
-        if (value > _intsetGet(is,intrev32ifbe(is->length)-1)) {
+        if (value > _intsetGet(is,max)) {
             if (pos) *pos = intrev32ifbe(is->length);
             return 0;
         } else if (value < _intsetGet(is,0)) {
@@ -265,7 +261,7 @@ int64_t intsetRandom(intset *is) {
     return _intsetGet(is,rand()%intrev32ifbe(is->length));
 }
 
-/* Sets the value to the value at the given position. When this position is
+/* Get the value at the given position. When this position is
  * out of range the function returns 0, when in range it returns 1. */
 uint8_t intsetGet(intset *is, uint32_t pos, int64_t *value) {
     if (pos < intrev32ifbe(is->length)) {
@@ -276,7 +272,7 @@ uint8_t intsetGet(intset *is, uint32_t pos, int64_t *value) {
 }
 
 /* Return intset length */
-uint32_t intsetLen(intset *is) {
+uint32_t intsetLen(const intset *is) {
     return intrev32ifbe(is->length);
 }
 
@@ -307,10 +303,10 @@ static void ok(void) {
     printf("OK\n");
 }
 
-static PORT_LONGLONG usec(void) {
+static long long usec(void) {
     struct timeval tv;
     gettimeofday(&tv,NULL);
-    return (((PORT_LONGLONG)tv.tv_sec)*1000000)+tv.tv_usec;
+    return (((long long)tv.tv_sec)*1000000)+tv.tv_usec;
 }
 
 #define assert(_e) ((_e)?(void)0:(_assert(#_e,__FILE__,__LINE__),exit(1)))
@@ -463,9 +459,9 @@ int intsetTest(int argc, char **argv) {
     }
 
     printf("Stress lookups: "); {
-        PORT_LONG num = 100000, size = 10000;
+        long num = 100000, size = 10000;
         int i, bits = 20;
-        PORT_LONGLONG start;
+        long long start;
         is = createSet(bits,size);
         checkConsistency(is);
 

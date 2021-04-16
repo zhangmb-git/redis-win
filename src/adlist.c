@@ -27,10 +27,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#ifdef _WIN32
-#include "Win32_Interop/Win32_Portability.h"
-#include "Win32_Interop/win32_types.h"
-#endif
+
 
 #include <stdlib.h>
 #include "adlist.h"
@@ -55,12 +52,10 @@ list *listCreate(void)
     return list;
 }
 
-/* Free the whole list.
- *
- * This function can't fail. */
-void listRelease(list *list)
+/* Remove all the elements from the list without destroying the list itself. */
+void listEmpty(list *list)
 {
-    PORT_ULONG len;
+    unsigned long len;
     listNode *current, *next;
 
     current = list->head;
@@ -71,6 +66,16 @@ void listRelease(list *list)
         zfree(current);
         current = next;
     }
+    list->head = list->tail = NULL;
+    list->len = 0;
+}
+
+/* Free the whole list.
+ *
+ * This function can't fail. */
+void listRelease(list *list)
+{
+    listEmpty(list);
     zfree(list);
 }
 
@@ -307,7 +312,7 @@ listNode *listSearchKey(list *list, void *key)
  * and so on. Negative integers are used in order to count
  * from the tail, -1 is the last element, -2 the penultimate
  * and so on. If the index is out of range NULL is returned. */
-listNode *listIndex(list *list, PORT_LONG index) {
+listNode *listIndex(list *list, long index) {
     listNode *n;
 
     if (index < 0) {
@@ -322,12 +327,11 @@ listNode *listIndex(list *list, PORT_LONG index) {
 }
 
 /* Rotate the list removing the tail node and inserting it to the head. */
-void listRotate(list *list) {
-    listNode *tail = list->tail;
-
+void listRotateTailToHead(list *list) {
     if (listLength(list) <= 1) return;
 
     /* Detach current tail */
+    listNode *tail = list->tail;
     list->tail = tail->prev;
     list->tail->next = NULL;
     /* Move it as head */
@@ -335,4 +339,38 @@ void listRotate(list *list) {
     tail->prev = NULL;
     tail->next = list->head;
     list->head = tail;
+}
+
+/* Rotate the list removing the head node and inserting it to the tail. */
+void listRotateHeadToTail(list *list) {
+    if (listLength(list) <= 1) return;
+
+    listNode *head = list->head;
+    /* Detach current head */
+    list->head = head->next;
+    list->head->prev = NULL;
+    /* Move it as tail */
+    list->tail->next = head;
+    head->next = NULL;
+    head->prev = list->tail;
+    list->tail = head;
+}
+
+/* Add all the elements of the list 'o' at the end of the
+ * list 'l'. The list 'other' remains empty but otherwise valid. */
+void listJoin(list *l, list *o) {
+    if (o->head)
+        o->head->prev = l->tail;
+
+    if (l->tail)
+        l->tail->next = o->head;
+    else
+        l->head = o->head;
+
+    if (o->tail) l->tail = o->tail;
+    l->len += o->len;
+
+    /* Setup other as an empty list. */
+    o->head = o->tail = NULL;
+    o->len = 0;
 }

@@ -79,10 +79,6 @@
 #include <string.h>
 #include "zmalloc.h"
 #include "endianconv.h"
-#ifdef _WIN32
-#include "Win32_Interop/Win32_Portability.h"
-#include "Win32_Interop/Win32_FDAPI.h"
-#endif
 
 #define ZIPMAP_BIGLEN 254
 #define ZIPMAP_END 255
@@ -169,7 +165,7 @@ static unsigned char *zipmapLookupRaw(unsigned char *zm, unsigned char *key, uns
     return k;
 }
 
-static unsigned int zipmapRequiredLength(unsigned int klen, unsigned int vlen) { WIN_PORT_FIX /* PORT_ULONG -> unsigned int */
+static unsigned long zipmapRequiredLength(unsigned int klen, unsigned int vlen) {
     unsigned int l;
 
     l = klen+vlen+3;
@@ -238,7 +234,7 @@ unsigned char *zipmapSet(unsigned char *zm, unsigned char *key, unsigned int kle
             /* Store the offset of this key within the current zipmap, so
              * it can be resized. Then, move the tail backwards so this
              * pair fits at the current position. */
-            offset = (unsigned int)(p-zm);
+            offset = p-zm;
             zm = zipmapResize(zm, zmlen-freelen+reqlen);
             p = zm+offset;
 
@@ -258,7 +254,7 @@ unsigned char *zipmapSet(unsigned char *zm, unsigned char *key, unsigned int kle
     if (empty >= ZIPMAP_VALUE_MAX_FREE) {
         /* First, move the tail <empty> bytes to the front, then resize
          * the zipmap to be <empty> bytes smaller. */
-        offset = (unsigned int)(p-zm);
+        offset = p-zm;
         memmove(p+reqlen, p+freelen, zmlen-(offset+freelen+1));
         zmlen -= empty;
         zm = zipmapResize(zm, zmlen);

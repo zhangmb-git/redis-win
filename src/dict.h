@@ -34,9 +34,6 @@
  */
 
 #include <stdint.h>
-#ifdef _WIN32
-#include "Win32_Interop/win32_types.h"
-#endif
 
 #ifndef __DICT_H
 #define __DICT_H
@@ -59,7 +56,7 @@ typedef struct dictEntry {
 } dictEntry;
 
 typedef struct dictType {
-    unsigned int (*hashFunction)(const void *key);
+    uint64_t (*hashFunction)(const void *key);
     void *(*keyDup)(void *privdata, const void *key);
     void *(*valDup)(void *privdata, const void *obj);
     int (*keyCompare)(void *privdata, const void *key1, const void *key2);
@@ -71,17 +68,17 @@ typedef struct dictType {
  * implement incremental rehashing, for the old to the new table. */
 typedef struct dictht {
     dictEntry **table;
-    PORT_ULONG size;
-    PORT_ULONG sizemask;
-    PORT_ULONG used;
+    unsigned long size;
+    unsigned long sizemask;
+    unsigned long used;
 } dictht;
 
 typedef struct dict {
     dictType *type;
     void *privdata;
     dictht ht[2];
-    PORT_LONG rehashidx; /* rehashing not in progress if rehashidx == -1 */
-    int iterators; /* number of iterators currently running */
+    long rehashidx; /* rehashing not in progress if rehashidx == -1 */
+    unsigned long iterators; /* number of iterators currently running */
 } dict;
 
 /* If safe is set to 1 this is a safe iterator, that means, you can call
@@ -90,14 +87,15 @@ typedef struct dict {
  * should be called while iterating. */
 typedef struct dictIterator {
     dict *d;
-    PORT_LONG index;
+    long index;
     int table, safe;
     dictEntry *entry, *nextEntry;
     /* unsafe iterator fingerprint for misuse detection. */
-    PORT_LONGLONG fingerprint;
+    long long fingerprint;
 } dictIterator;
 
 typedef void (dictScanFunction)(void *privdata, const dictEntry *de);
+typedef void (dictScanBucketFunction)(void *privdata, dictEntry **bucketref);
 
 /* This is the initial size of every hash table */
 #define DICT_HT_INITIAL_SIZE     4
@@ -109,19 +107,19 @@ typedef void (dictScanFunction)(void *privdata, const dictEntry *de);
 
 #define dictSetVal(d, entry, _val_) do { \
     if ((d)->type->valDup) \
-        entry->v.val = (d)->type->valDup((d)->privdata, _val_); \
+        (entry)->v.val = (d)->type->valDup((d)->privdata, _val_); \
     else \
-        entry->v.val = (_val_); \
+        (entry)->v.val = (_val_); \
 } while(0)
 
 #define dictSetSignedIntegerVal(entry, _val_) \
-    do { entry->v.s64 = _val_; } while(0)
+    do { (entry)->v.s64 = _val_; } while(0)
 
 #define dictSetUnsignedIntegerVal(entry, _val_) \
-    do { entry->v.u64 = _val_; } while(0)
+    do { (entry)->v.u64 = _val_; } while(0)
 
 #define dictSetDoubleVal(entry, _val_) \
-    do { entry->v.d = _val_; } while(0)
+    do { (entry)->v.d = _val_; } while(0)
 
 #define dictFreeKey(d, entry) \
     if ((d)->type->keyDestructor) \
@@ -129,9 +127,9 @@ typedef void (dictScanFunction)(void *privdata, const dictEntry *de);
 
 #define dictSetKey(d, entry, _key_) do { \
     if ((d)->type->keyDup) \
-        entry->key = (d)->type->keyDup((d)->privdata, _key_); \
+        (entry)->key = (d)->type->keyDup((d)->privdata, _key_); \
     else \
-        entry->key = (_key_); \
+        (entry)->key = (_key_); \
 } while(0)
 
 #define dictCompareKeys(d, key1, key2) \
@@ -151,13 +149,14 @@ typedef void (dictScanFunction)(void *privdata, const dictEntry *de);
 
 /* API */
 dict *dictCreate(dictType *type, void *privDataPtr);
-int dictExpand(dict *d, PORT_ULONG size);
+int dictExpand(dict *d, unsigned long size);
 int dictAdd(dict *d, void *key, void *val);
-dictEntry *dictAddRaw(dict *d, void *key);
+dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing);
+dictEntry *dictAddOrFind(dict *d, void *key);
 int dictReplace(dict *d, void *key, void *val);
-dictEntry *dictReplaceRaw(dict *d, void *key);
 int dictDelete(dict *d, const void *key);
-int dictDeleteNoFree(dict *d, const void *key);
+dictEntry *dictUnlink(dict *ht, const void *key);
+void dictFreeUnlinkedEntry(dict *d, dictEntry *he);
 void dictRelease(dict *d);
 dictEntry * dictFind(dict *d, const void *key);
 void *dictFetchValue(dict *d, const void *key);
@@ -167,18 +166,21 @@ dictIterator *dictGetSafeIterator(dict *d);
 dictEntry *dictNext(dictIterator *iter);
 void dictReleaseIterator(dictIterator *iter);
 dictEntry *dictGetRandomKey(dict *d);
+dictEntry *dictGetFairRandomKey(dict *d);
 unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count);
 void dictGetStats(char *buf, size_t bufsize, dict *d);
-unsigned int dictGenHashFunction(const void *key, int len);
-unsigned int dictGenCaseHashFunction(const unsigned char *buf, int len);
+uint64_t dictGenHashFunction(const void *key, int len);
+uint64_t dictGenCaseHashFunction(const unsigned char *buf, int len);
 void dictEmpty(dict *d, void(callback)(void*));
 void dictEnableResize(void);
 void dictDisableResize(void);
 int dictRehash(dict *d, int n);
 int dictRehashMilliseconds(dict *d, int ms);
-void dictSetHashFunctionSeed(unsigned int initval);
-unsigned int dictGetHashFunctionSeed(void);
-PORT_ULONG dictScan(dict *d, PORT_ULONG v, dictScanFunction *fn, void *privdata);
+void dictSetHashFunctionSeed(uint8_t *seed);
+uint8_t *dictGetHashFunctionSeed(void);
+unsigned long dictScan(dict *d, unsigned long v, dictScanFunction *fn, dictScanBucketFunction *bucketfn, void *privdata);
+uint64_t dictGetHash(dict *d, const void *key);
+dictEntry **dictFindEntryRefByPtrAndHash(dict *d, const void *oldptr, uint64_t hash);
 
 /* Hash table types */
 extern dictType dictTypeHeapStringCopyKey;

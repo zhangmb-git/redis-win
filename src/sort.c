@@ -33,7 +33,7 @@
 #include "pqsort.h" /* Partial qsort for SORT+LIMIT */
 #include <math.h> /* isnan() */
 
-zskiplistNode* zslGetElementByRank(zskiplist *zsl, PORT_ULONG rank);
+zskiplistNode* zslGetElementByRank(zskiplist *zsl, unsigned long rank);
 
 redisSortOperation *createSortOperation(int type, robj *pattern) {
     redisSortOperation *so = zmalloc(sizeof(*so));
@@ -58,7 +58,7 @@ redisSortOperation *createSortOperation(int type, robj *pattern) {
  *
  * The returned object will always have its refcount increased by 1
  * when it is non-NULL. */
-robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
+robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst, int writeflag) {
     char *p, *f, *k;
     sds spat, ssub;
     robj *keyobj, *fieldobj = NULL, *o;
@@ -88,16 +88,16 @@ robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
 
     /* Find out if we're dealing with a hash dereference. */
     if ((f = strstr(p+1, "->")) != NULL && *(f+2) != '\0') {
-        fieldlen = (int)(sdslen(spat)-(f-spat)-2);                              WIN_PORT_FIX /* cast (int) */
+        fieldlen = sdslen(spat)-(f-spat)-2;
         fieldobj = createStringObject(f+2,fieldlen);
     } else {
         fieldlen = 0;
     }
 
     /* Perform the '*' substitution. */
-    prefixlen = (int)(p-spat);                                                  WIN_PORT_FIX /* cast (int) */
-    sublen = (int)sdslen(ssub);                                                 WIN_PORT_FIX /* cast (int) */
-    postfixlen = (int)(sdslen(spat)-(prefixlen+1)-(fieldlen ? fieldlen+2 : 0)); WIN_PORT_FIX /* cast (int) */
+    prefixlen = p-spat;
+    sublen = sdslen(ssub);
+    postfixlen = sdslen(spat)-(prefixlen+1)-(fieldlen ? fieldlen+2 : 0);
     keyobj = createStringObject(NULL,prefixlen+sublen+postfixlen);
     k = keyobj->ptr;
     memcpy(k,spat,prefixlen);
@@ -106,15 +106,18 @@ robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
     decrRefCount(subst); /* Incremented by decodeObject() */
 
     /* Lookup substituted key */
-    o = lookupKeyRead(db,keyobj);
+    if (!writeflag)
+        o = lookupKeyRead(db,keyobj);
+    else
+        o = lookupKeyWrite(db,keyobj);
     if (o == NULL) goto noobj;
 
     if (fieldobj) {
         if (o->type != OBJ_HASH) goto noobj;
 
-        /* Retrieve value from hash by the field name. This operation
-         * already increases the refcount of the returned object. */
-        o = hashTypeGetObject(o, fieldobj);
+        /* Retrieve value from hash by the field name. The returend object
+         * is a new object with refcount already incremented. */
+        o = hashTypeGetValueObject(o, fieldobj->ptr);
     } else {
         if (o->type != OBJ_STRING) goto noobj;
 
@@ -190,37 +193,19 @@ void sortCommand(client *c) {
     list *operations;
     unsigned int outputlen = 0;
     int desc = 0, alpha = 0;
-    PORT_LONG limit_start = 0, limit_count = -1, start, end;
+    long limit_start = 0, limit_count = -1, start, end;
     int j, dontsort = 0, vectorlen;
     int getop = 0; /* GET operation counter */
-    int int_convertion_error = 0;
+    int int_conversion_error = 0;
     int syntax_error = 0;
     robj *sortval, *sortby = NULL, *storekey = NULL;
     redisSortObject *vector; /* Resulting vector to sort */
-
-    /* Lookup the key to sort. It must be of the right types */
-    sortval = lookupKeyRead(c->db,c->argv[1]);
-    if (sortval && sortval->type != OBJ_SET &&
-                   sortval->type != OBJ_LIST &&
-                   sortval->type != OBJ_ZSET)
-    {
-        addReply(c,shared.wrongtypeerr);
-        return;
-    }
 
     /* Create a list of operations to perform for every sorted element.
      * Operations can be GET */
     operations = listCreate();
     listSetFreeMethod(operations,zfree);
     j = 2; /* options start at argv[2] */
-
-    /* Now we need to protect sortval incrementing its count, in the future
-     * SORT may have options able to overwrite/delete keys during the sorting
-     * and the sorted key itself may get destroyed */
-    if (sortval)
-        incrRefCount(sortval);
-    else
-        sortval = createQuicklistObject();
 
     /* The SORT command has an SQL-alike syntax, parse it */
     while(j < c->argc) {
@@ -280,10 +265,32 @@ void sortCommand(client *c) {
 
     /* Handle syntax errors set during options parsing. */
     if (syntax_error) {
-        decrRefCount(sortval);
         listRelease(operations);
         return;
     }
+
+    /* Lookup the key to sort. It must be of the right types */
+    if (storekey)
+        sortval = lookupKeyRead(c->db,c->argv[1]);
+    else
+        sortval = lookupKeyWrite(c->db,c->argv[1]);
+    if (sortval && sortval->type != OBJ_SET &&
+                   sortval->type != OBJ_LIST &&
+                   sortval->type != OBJ_ZSET)
+    {
+        listRelease(operations);
+        addReply(c,shared.wrongtypeerr);
+        return;
+    }
+
+    /* Now we need to protect sortval incrementing its count, in the future
+     * SORT may have options able to overwrite/delete keys during the sorting
+     * and the sorted key itself may get destroyed */
+    if (sortval)
+        incrRefCount(sortval);
+    else
+        sortval = createQuicklistObject();
+
 
     /* When sorting a set with no sort specified, we must sort the output
      * so the result is consistent across scripting and replication.
@@ -307,9 +314,9 @@ void sortCommand(client *c) {
 
     /* Objtain the length of the object to sort. */
     switch(sortval->type) {
-    case OBJ_LIST: vectorlen = (int)listTypeLength(sortval); break;           WIN_PORT_FIX /* cast (int) */
-    case OBJ_SET: vectorlen =  (int)setTypeSize(sortval); break;              WIN_PORT_FIX /* cast (int) */
-    case OBJ_ZSET: vectorlen = (int)dictSize(((zset*)sortval->ptr)->dict); break; WIN_PORT_FIX /* cast (int) */
+    case OBJ_LIST: vectorlen = listTypeLength(sortval); break;
+    case OBJ_SET: vectorlen =  setTypeSize(sortval); break;
+    case OBJ_ZSET: vectorlen = dictSize(((zset*)sortval->ptr)->dict); break;
     default: vectorlen = 0; serverPanic("Bad SORT type"); /* Avoid GCC warning */
     }
 
@@ -336,7 +343,7 @@ void sortCommand(client *c) {
         dontsort &&
         (start != 0 || end != vectorlen-1))
     {
-        vectorlen = (int)(end-start+1);                                         WIN_PORT_FIX /* cast (int) */
+        vectorlen = end-start+1;
     }
 
     /* Load the sorting vector with all the objects to sort */
@@ -354,7 +361,7 @@ void sortCommand(client *c) {
             listTypeIterator *li;
             listTypeEntry entry;
             li = listTypeInitIterator(sortval,
-                    desc ? (PORT_LONG)(listTypeLength(sortval) - start - 1) : start,
+                    desc ? (long)(listTypeLength(sortval) - start - 1) : start,
                     desc ? LIST_HEAD : LIST_TAIL);
 
             while(j < vectorlen && listTypeNext(li,&entry)) {
@@ -380,9 +387,9 @@ void sortCommand(client *c) {
         listTypeReleaseIterator(li);
     } else if (sortval->type == OBJ_SET) {
         setTypeIterator *si = setTypeInitIterator(sortval);
-        robj *ele;
-        while((ele = setTypeNextObject(si)) != NULL) {
-            vector[j].obj = ele;
+        sds sdsele;
+        while((sdsele = setTypeNextObject(si)) != NULL) {
+            vector[j].obj = createObject(OBJ_STRING,sdsele);
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
             j++;
@@ -399,12 +406,12 @@ void sortCommand(client *c) {
         zset *zs = sortval->ptr;
         zskiplist *zsl = zs->zsl;
         zskiplistNode *ln;
-        robj *ele;
+        sds sdsele;
         int rangelen = vectorlen;
 
         /* Check if starting point is trivial, before doing log(N) lookup. */
         if (desc) {
-            PORT_LONG zsetlen = (PORT_LONG) dictSize(((zset*)sortval->ptr)->dict); WIN_PORT_FIX /* cast (PORT_LONG) */
+            long zsetlen = dictSize(((zset*)sortval->ptr)->dict);
 
             ln = zsl->tail;
             if (start > 0)
@@ -417,8 +424,8 @@ void sortCommand(client *c) {
 
         while(rangelen--) {
             serverAssertWithInfo(c,sortval,ln != NULL);
-            ele = ln->obj;
-            vector[j].obj = ele;
+            sdsele = ln->ele;
+            vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
             j++;
@@ -431,9 +438,11 @@ void sortCommand(client *c) {
         dict *set = ((zset*)sortval->ptr)->dict;
         dictIterator *di;
         dictEntry *setele;
+        sds sdsele;
         di = dictGetIterator(set);
         while((setele = dictNext(di)) != NULL) {
-            vector[j].obj = dictGetKey(setele);
+            sdsele =  dictGetKey(setele);
+            vector[j].obj = createStringObject(sdsele,sdslen(sdsele));
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
             j++;
@@ -445,12 +454,12 @@ void sortCommand(client *c) {
     serverAssertWithInfo(c,sortval,j == vectorlen);
 
     /* Now it's time to load the right scores in the sorting vector */
-    if (dontsort == 0) {
+    if (!dontsort) {
         for (j = 0; j < vectorlen; j++) {
             robj *byval;
             if (sortby) {
                 /* lookup value to sort by */
-                byval = lookupKeyByPattern(c->db,sortby,vector[j].obj);
+                byval = lookupKeyByPattern(c->db,sortby,vector[j].obj,storekey!=NULL);
                 if (!byval) continue;
             } else {
                 /* use object itself to sort by */
@@ -467,13 +476,13 @@ void sortCommand(client *c) {
                     if (eptr[0] != '\0' || errno == ERANGE ||
                         isnan(vector[j].u.score))
                     {
-                        int_convertion_error = 1;
+                        int_conversion_error = 1;
                     }
                 } else if (byval->encoding == OBJ_ENCODING_INT) {
                     /* Don't need to decode the object if it's
                      * integer-encoded (the only encoding supported) so
                      * far. We can just cast it */
-                    vector[j].u.score = (PORT_LONG)byval->ptr;
+                    vector[j].u.score = (long)byval->ptr;
                 } else {
                     serverAssertWithInfo(c,sortval,1 != 1);
                 }
@@ -485,9 +494,7 @@ void sortCommand(client *c) {
                 decrRefCount(byval);
             }
         }
-    }
 
-    if (dontsort == 0) {
         server.sort_desc = desc;
         server.sort_alpha = alpha;
         server.sort_bypattern = sortby ? 1 : 0;
@@ -500,13 +507,13 @@ void sortCommand(client *c) {
 
     /* Send command output to the output buffer, performing the specified
      * GET/DEL/INCR/DECR operations if any. */
-    outputlen = getop ? (unsigned int)(getop*(end-start+1)) : (unsigned int)(end-start+1); WIN_PORT_FIX /* cast (unsigned int), cast (unsigned int) */
-    if (int_convertion_error) {
+    outputlen = getop ? getop*(end-start+1) : end-start+1;
+    if (int_conversion_error) {
         addReplyError(c,"One or more scores can't be converted into double");
     } else if (storekey == NULL) {
         /* STORE option not specified, sent the sorting result to client */
-        addReplyMultiBulkLen(c,outputlen);
-        for (j = (int)start; j <= end; j++) {                                   WIN_PORT_FIX /* cast (int) */
+        addReplyArrayLen(c,outputlen);
+        for (j = start; j <= end; j++) {
             listNode *ln;
             listIter li;
 
@@ -515,11 +522,11 @@ void sortCommand(client *c) {
             while((ln = listNext(&li))) {
                 redisSortOperation *sop = ln->value;
                 robj *val = lookupKeyByPattern(c->db,sop->pattern,
-                    vector[j].obj);
+                    vector[j].obj,storekey!=NULL);
 
                 if (sop->type == SORT_OP_GET) {
                     if (!val) {
-                        addReply(c,shared.nullbulk);
+                        addReplyNull(c);
                     } else {
                         addReplyBulk(c,val);
                         decrRefCount(val);
@@ -534,7 +541,7 @@ void sortCommand(client *c) {
         robj *sobj = createQuicklistObject();
 
         /* STORE option specified, set the sorting result as a List object */
-        for (j = (int)start; j <= end; j++) {                                   WIN_PORT_FIX /* cast (int) */
+        for (j = start; j <= end; j++) {
             listNode *ln;
             listIter li;
 
@@ -545,7 +552,7 @@ void sortCommand(client *c) {
                 while((ln = listNext(&li))) {
                     redisSortOperation *sop = ln->value;
                     robj *val = lookupKeyByPattern(c->db,sop->pattern,
-                        vector[j].obj);
+                        vector[j].obj,storekey!=NULL);
 
                     if (sop->type == SORT_OP_GET) {
                         if (!val) val = createStringObject("",0);
@@ -563,12 +570,12 @@ void sortCommand(client *c) {
             }
         }
         if (outputlen) {
-            setKey(c->db,storekey,sobj);
+            setKey(c,c->db,storekey,sobj);
             notifyKeyspaceEvent(NOTIFY_LIST,"sortstore",storekey,
                                 c->db->id);
             server.dirty += outputlen;
         } else if (dbDelete(c->db,storekey)) {
-            signalModifiedKey(c->db,storekey);
+            signalModifiedKey(c,c->db,storekey);
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",storekey,c->db->id);
             server.dirty++;
         }
@@ -577,9 +584,9 @@ void sortCommand(client *c) {
     }
 
     /* Cleanup */
-    if (sortval->type == OBJ_LIST || sortval->type == OBJ_SET)
-        for (j = 0; j < vectorlen; j++)
-            decrRefCount(vector[j].obj);
+    for (j = 0; j < vectorlen; j++)
+        decrRefCount(vector[j].obj);
+
     decrRefCount(sortval);
     listRelease(operations);
     for (j = 0; j < vectorlen; j++) {

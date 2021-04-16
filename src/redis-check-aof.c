@@ -28,33 +28,16 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef _WIN32
-#include "Win32_Interop/Win32_Portability.h"
-#include "Win32_Interop/win32_types.h"
-#include "Win32_Interop/Win32_Error.h"
-#include "Win32_Interop/win32fixes.h"
-#endif
-
-#include "fmacros.h"
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-POSIX_ONLY(#include <unistd.h>)
+#include "server.h"
 #include <sys/stat.h>
-#include "config.h"
-
-#ifdef _WIN32
-#define strcasecmp _stricmp
-#define strncasecmp _strnicmp
-#endif
 
 #define ERROR(...) { \
     char __buf[1024]; \
-    sprintf(__buf, __VA_ARGS__); \
-    sprintf(error, "0x%16llx: %s", (PORT_LONGLONG)epos, __buf); \
+    snprintf(__buf, sizeof(__buf), __VA_ARGS__); \
+    snprintf(error, sizeof(error), "0x%16llx: %s", (long long)epos, __buf); \
 }
 
-static char error[1024];
+static char error[1044];
 static off_t epos;
 
 int consumeNewline(char *buf) {
@@ -65,33 +48,33 @@ int consumeNewline(char *buf) {
     return 1;
 }
 
-int readLong(FILE *fp, char prefix, PORT_LONG *target) {
+int readLong(FILE *fp, char prefix, long *target) {
     char buf[128], *eptr;
     epos = ftello(fp);
     if (fgets(buf,sizeof(buf),fp) == NULL) {
         return 0;
     }
     if (buf[0] != prefix) {
-        ERROR("Expected prefix '%c', got: '%c'",buf[0],prefix);
+        ERROR("Expected prefix '%c', got: '%c'",prefix,buf[0]);
         return 0;
     }
     *target = strtol(buf+1,&eptr,10);
     return consumeNewline(eptr);
 }
 
-int readBytes(FILE *fp, char *target, PORT_LONG length) {
-    PORT_LONG real;
+int readBytes(FILE *fp, char *target, long length) {
+    long real;
     epos = ftello(fp);
-    real = (PORT_LONG) fread(target, 1, length, fp);
+    real = fread(target,1,length,fp);
     if (real != length) {
-        ERROR("Expected to read %ld bytes, got %ld bytes", length, real); /* TODO: verify %ld */
+        ERROR("Expected to read %ld bytes, got %ld bytes",length,real);
         return 0;
     }
     return 1;
 }
 
 int readString(FILE *fp, char** target) {
-    PORT_LONG len;
+    long len;
     *target = NULL;
     if (!readLong(fp,'$',&len)) {
         return 0;
@@ -99,7 +82,7 @@ int readString(FILE *fp, char** target) {
 
     /* Increase length to also consume \r\n */
     len += 2;
-    *target = (char*)malloc(len);
+    *target = (char*)zmalloc(len);
     if (!readBytes(fp,*target,len)) {
         return 0;
     }
@@ -110,18 +93,18 @@ int readString(FILE *fp, char** target) {
     return 1;
 }
 
-int readArgc(FILE *fp, PORT_LONG *target) {
+int readArgc(FILE *fp, long *target) {
     return readLong(fp,'*',target);
 }
 
 off_t process(FILE *fp) {
-    PORT_LONG argc;
+    long argc;
     off_t pos = 0;
     int i, multi = 0;
     char *str;
 
     while(1) {
-        if (!multi) pos = (off_t)ftello(fp);
+        if (!multi) pos = ftello(fp);
         if (!readArgc(fp, &argc)) break;
 
         for (i = 0; i < argc; i++) {
@@ -139,12 +122,12 @@ off_t process(FILE *fp) {
                     }
                 }
             }
-            free(str);
+            zfree(str);
         }
 
         /* Stop if the loop did not finish */
         if (i < argc) {
-            if (str) free(str);
+            if (str) zfree(str);
             break;
         }
     }
@@ -158,15 +141,9 @@ off_t process(FILE *fp) {
     return pos;
 }
 
-int main(int argc, char **argv) {
+int redis_check_aof_main(int argc, char **argv) {
     char *filename;
     int fix = 0;
-#ifdef _WIN32
-    _fmode = _O_BINARY;
-    setmode(_fileno(stdin), _O_BINARY);
-    setmode(_fileno(stdout), _O_BINARY);
-    setmode(_fileno(stderr), _O_BINARY);
-#endif
 
     if (argc < 2) {
         printf("Usage: %s [--fix] <file.aof>\n", argv[0]);
@@ -185,7 +162,7 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
-    FILE *fp = fopen(filename,IF_WIN32("r+b","r+"));
+    FILE *fp = fopen(filename,"r+");
     if (fp == NULL) {
         printf("Cannot open file: %s\n", filename);
         exit(1);
@@ -203,14 +180,33 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    /* This AOF file may have an RDB preamble. Check this to start, and if this
+     * is the case, start processing the RDB part. */
+    if (size >= 8) {    /* There must be at least room for the RDB header. */
+        char sig[5];
+        int has_preamble = fread(sig,sizeof(sig),1,fp) == 1 &&
+                            memcmp(sig,"REDIS",sizeof(sig)) == 0;
+        rewind(fp);
+        if (has_preamble) {
+            printf("The AOF appears to start with an RDB preamble.\n"
+                   "Checking the RDB preamble to start:\n");
+            if (redis_check_rdb_main(argc,argv,fp) == C_ERR) {
+                printf("RDB preamble of AOF file is not sane, aborting.\n");
+                exit(1);
+            } else {
+                printf("RDB preamble is OK, proceeding with AOF tail...\n");
+            }
+        }
+    }
+
     off_t pos = process(fp);
     off_t diff = size-pos;
     printf("AOF analyzed: size=%lld, ok_up_to=%lld, diff=%lld\n",
-        (PORT_LONGLONG) size, (PORT_LONGLONG) pos, (PORT_LONGLONG) diff);
+        (long long) size, (long long) pos, (long long) diff);
     if (diff > 0) {
         if (fix) {
             char buf[2];
-            printf("This will shrink the AOF from %lld bytes, with %lld bytes, to %lld bytes\n",(PORT_LONGLONG)size,(PORT_LONGLONG)diff,(PORT_LONGLONG)pos);
+            printf("This will shrink the AOF from %lld bytes, with %lld bytes, to %lld bytes\n",(long long)size,(long long)diff,(long long)pos);
             printf("Continue? [y/N]: ");
             if (fgets(buf,sizeof(buf),stdin) == NULL ||
                 strncasecmp(buf,"y",1) != 0) {
@@ -224,7 +220,8 @@ int main(int argc, char **argv) {
                 printf("Successfully truncated AOF\n");
             }
         } else {
-            printf("AOF is not valid\n");
+            printf("AOF is not valid. "
+                   "Use the --fix option to try fixing it.\n");
             exit(1);
         }
     } else {
@@ -232,5 +229,5 @@ int main(int argc, char **argv) {
     }
 
     fclose(fp);
-    return 0;
+    exit(0);
 }

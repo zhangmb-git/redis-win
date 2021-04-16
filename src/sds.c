@@ -30,18 +30,16 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef _WIN32
-#include "Win32_Interop/Win32_Portability.h"
-#include "Win32_Interop/win32fixes.h"
-#endif
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <limits.h>
 #include "sds.h"
 #include "sdsalloc.h"
+
+const char *SDS_NOINIT = "SDS_NOINIT";
 
 static inline int sdsHdrSize(char type) {
     switch(type&SDS_TYPE_MASK) {
@@ -66,14 +64,19 @@ static inline char sdsReqType(size_t string_size) {
         return SDS_TYPE_8;
     if (string_size < 1<<16)
         return SDS_TYPE_16;
+#if (LONG_MAX == LLONG_MAX)
     if (string_size < 1ll<<32)
         return SDS_TYPE_32;
     return SDS_TYPE_64;
+#else
+    return SDS_TYPE_32;
+#endif
 }
 
 /* Create a new sds string with the content specified by the 'init' pointer
  * and 'initlen'.
  * If NULL is used for 'init' the string is initialized with zero bytes.
+ * If SDS_NOINIT is used, the buffer is left uninitialized;
  *
  * The string is always null-termined (all the sds strings are, always) so
  * even if you create an sds string with:
@@ -94,34 +97,36 @@ sds sdsnewlen(const void *init, size_t initlen) {
     unsigned char *fp; /* flags pointer. */
 
     sh = s_malloc(hdrlen+initlen+1);
-    if (!init)
-        memset(sh, 0, hdrlen+initlen+1);
     if (sh == NULL) return NULL;
+    if (init==SDS_NOINIT)
+        init = NULL;
+    else if (!init)
+        memset(sh, 0, hdrlen+initlen+1);
     s = (char*)sh+hdrlen;
     fp = ((unsigned char*)s)-1;
     switch(type) {
         case SDS_TYPE_5: {
-            *fp = type | (unsigned char)(initlen << SDS_TYPE_BITS);             WIN_PORT_FIX /* cast (unsigned char) */
+            *fp = type | (initlen << SDS_TYPE_BITS);
             break;
         }
         case SDS_TYPE_8: {
             SDS_HDR_VAR(8,s);
-            sh->len = (uint8_t)initlen;                                         WIN_PORT_FIX /* cast (uint8_t) */
-            sh->alloc = (uint8_t)initlen;                                       WIN_PORT_FIX /* cast (uint8_t) */
+            sh->len = initlen;
+            sh->alloc = initlen;
             *fp = type;
             break;
         }
         case SDS_TYPE_16: {
             SDS_HDR_VAR(16,s);
-            sh->len = (uint16_t)initlen;                                        WIN_PORT_FIX /* cast (uint16_t) */
-            sh->alloc = (uint16_t)initlen;                                      WIN_PORT_FIX /* cast (uint16_t) */
+            sh->len = initlen;
+            sh->alloc = initlen;
             *fp = type;
             break;
         }
         case SDS_TYPE_32: {
             SDS_HDR_VAR(32,s);
-            sh->len = (uint32_t)initlen;                                        WIN_PORT_FIX /* cast (uint32_t) */
-            sh->alloc = (uint32_t)initlen;                                      WIN_PORT_FIX /* cast (uint32_t) */
+            sh->len = initlen;
+            sh->alloc = initlen;
             *fp = type;
             break;
         }
@@ -177,7 +182,7 @@ void sdsfree(sds s) {
  * the output will be "6" as the string was modified but the logical length
  * remains 6 bytes. */
 void sdsupdatelen(sds s) {
-    int reallen = (int)strlen(s);                                               WIN_PORT_FIX /* cast (int) */
+    size_t reallen = strlen(s);
     sdssetlen(s, reallen);
 }
 
@@ -250,16 +255,27 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
 sds sdsRemoveFreeSpace(sds s) {
     void *sh, *newsh;
     char type, oldtype = s[-1] & SDS_TYPE_MASK;
-    int hdrlen;
+    int hdrlen, oldhdrlen = sdsHdrSize(oldtype);
     size_t len = sdslen(s);
-    sh = (char*)s-sdsHdrSize(oldtype);
+    size_t avail = sdsavail(s);
+    sh = (char*)s-oldhdrlen;
 
+    /* Return ASAP if there is no space left. */
+    if (avail == 0) return s;
+
+    /* Check what would be the minimum SDS header that is just good enough to
+     * fit this string. */
     type = sdsReqType(len);
     hdrlen = sdsHdrSize(type);
-    if (oldtype==type) {
-        newsh = s_realloc(sh, hdrlen+len+1);
+
+    /* If the type is the same, or at least a large enough type is still
+     * required, we just realloc(), letting the allocator to do the copy
+     * only if really needed. Otherwise if the change is huge, we manually
+     * reallocate the string to use the different header type. */
+    if (oldtype==type || type > SDS_TYPE_8) {
+        newsh = s_realloc(sh, oldhdrlen+len+1);
         if (newsh == NULL) return NULL;
-        s = (char*)newsh+hdrlen;
+        s = (char*)newsh+oldhdrlen;
     } else {
         newsh = s_malloc(hdrlen+len+1);
         if (newsh == NULL) return NULL;
@@ -273,7 +289,7 @@ sds sdsRemoveFreeSpace(sds s) {
     return s;
 }
 
-/* Return the total size of the allocation of the specifed sds string,
+/* Return the total size of the allocation of the specified sds string,
  * including:
  * 1) The sds header before the pointer.
  * 2) The string.
@@ -314,7 +330,7 @@ void *sdsAllocPtr(sds s) {
  * ... check for nread <= 0 and handle it ...
  * sdsIncrLen(s, nread);
  */
-void sdsIncrLen(sds s, int incr) {
+void sdsIncrLen(sds s, ssize_t incr) {
     unsigned char flags = s[-1];
     size_t len;
     switch(flags&SDS_TYPE_MASK) {
@@ -431,9 +447,9 @@ sds sdscpy(sds s, const char *t) {
  * The function returns the length of the null-terminated string
  * representation stored at 's'. */
 #define SDS_LLSTR_SIZE 21
-int sdsll2str(char *s, PORT_LONGLONG value) {
+int sdsll2str(char *s, long long value) {
     char *p, aux;
-    PORT_ULONGLONG v;
+    unsigned long long v;
     size_t l;
 
     /* Generate the string representation, this method produces
@@ -459,11 +475,11 @@ int sdsll2str(char *s, PORT_LONGLONG value) {
         s++;
         p--;
     }
-    return (int)l;                                                              WIN_PORT_FIX /* cast (int) */
+    return l;
 }
 
-/* Identical sdsll2str(), but for PORT_ULONGLONG type. */
-int sdsull2str(char *s, PORT_ULONGLONG v) {
+/* Identical sdsll2str(), but for unsigned long long type. */
+int sdsull2str(char *s, unsigned long long v) {
     char *p, aux;
     size_t l;
 
@@ -488,14 +504,14 @@ int sdsull2str(char *s, PORT_ULONGLONG v) {
         s++;
         p--;
     }
-    return (int)l;
+    return l;
 }
 
-/* Create an sds string from a PORT_LONGLONG value. It is much faster than:
+/* Create an sds string from a long long value. It is much faster than:
  *
  * sdscatprintf(sdsempty(),"%lld\n", value);
  */
-sds sdsfromlonglong(PORT_LONGLONG value) {
+sds sdsfromlonglong(long long value) {
     char buf[SDS_LLSTR_SIZE];
     int len = sdsll2str(buf,value);
 
@@ -511,11 +527,10 @@ sds sdscatvprintf(sds s, const char *fmt, va_list ap) {
     /* We try to start using a static buffer for speed.
      * If not possible we revert to heap allocation. */
     if (buflen > sizeof(staticbuf)) {
-        buf = IF_WIN32(zcalloc,s_malloc)(buflen);
+        buf = s_malloc(buflen);
         if (buf == NULL) return NULL;
     } else {
         buflen = sizeof(staticbuf);
-        WIN32_ONLY(memset(staticbuf, 0, sizeof(staticbuf));)
     }
 
     /* Try with buffers two times bigger every time we fail to
@@ -528,7 +543,7 @@ sds sdscatvprintf(sds s, const char *fmt, va_list ap) {
         if (buf[buflen-2] != '\0') {
             if (buf != staticbuf) s_free(buf);
             buflen *= 2;
-            buf = IF_WIN32(zcalloc,s_malloc)(buflen);
+            buf = s_malloc(buflen);
             if (buf == NULL) return NULL;
             continue;
         }
@@ -577,25 +592,29 @@ sds sdscatprintf(sds s, const char *fmt, ...) {
  * %s - C String
  * %S - SDS string
  * %i - signed int
- * %I - 64 bit signed integer (PORT_LONGLONG, int64_t)
+ * %I - 64 bit signed integer (long long, int64_t)
  * %u - unsigned int
- * %U - 64 bit unsigned integer (PORT_ULONGLONG, uint64_t)
+ * %U - 64 bit unsigned integer (unsigned long long, uint64_t)
  * %% - Verbatim "%" character.
  */
 sds sdscatfmt(sds s, char const *fmt, ...) {
     size_t initlen = sdslen(s);
     const char *f = fmt;
-    int i;
+    long i;
     va_list ap;
 
+    /* To avoid continuous reallocations, let's start with a buffer that
+     * can hold at least two times the format string itself. It's not the
+     * best heuristic but seems to work in practice. */
+    s = sdsMakeRoomFor(s, initlen + strlen(fmt)*2);
     va_start(ap,fmt);
     f = fmt;    /* Next format specifier byte to process. */
-    i = (int)initlen; /* Position of the next byte to write to dest str. */
+    i = initlen; /* Position of the next byte to write to dest str. */
     while(*f) {
         char next, *str;
         size_t l;
-        PORT_LONGLONG num;
-        PORT_ULONGLONG unum;
+        long long num;
+        unsigned long long unum;
 
         /* Make sure there is always space for at least 1 char. */
         if (sdsavail(s)==0) {
@@ -610,20 +629,20 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
             case 's':
             case 'S':
                 str = va_arg(ap,char*);
-                l = (int)((next == 's') ? strlen(str) : sdslen(str));           WIN_PORT_FIX /* cast (int) */
+                l = (next == 's') ? strlen(str) : sdslen(str);
                 if (sdsavail(s) < l) {
                     s = sdsMakeRoomFor(s,l);
                 }
                 memcpy(s+i,str,l);
                 sdsinclen(s,l);
-                i += (int)l;                                                    WIN_PORT_FIX /* cast (int) */
+                i += l;
                 break;
             case 'i':
             case 'I':
                 if (next == 'i')
                     num = va_arg(ap,int);
                 else
-                    num = va_arg(ap,PORT_LONGLONG);
+                    num = va_arg(ap,long long);
                 {
                     char buf[SDS_LLSTR_SIZE];
                     l = sdsll2str(buf,num);
@@ -632,7 +651,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                     }
                     memcpy(s+i,buf,l);
                     sdsinclen(s,l);
-                    i += (int)l;                                                WIN_PORT_FIX /* cast (int) */
+                    i += l;
                 }
                 break;
             case 'u':
@@ -640,7 +659,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                 if (next == 'u')
                     unum = va_arg(ap,unsigned int);
                 else
-                    unum = va_arg(ap,PORT_ULONGLONG);
+                    unum = va_arg(ap,unsigned long long);
                 {
                     char buf[SDS_LLSTR_SIZE];
                     l = sdsull2str(buf,unum);
@@ -649,7 +668,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                     }
                     memcpy(s+i,buf,l);
                     sdsinclen(s,l);
-                    i += (int)l;                                                WIN_PORT_FIX /* cast (int) */
+                    i += l;
                 }
                 break;
             default: /* Handle %% and generally %<unknown>. */
@@ -684,7 +703,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
  * s = sdstrim(s,"Aa. :");
  * printf("%s\n", s);
  *
- * Output will be just "Hello World".
+ * Output will be just "HelloWorld".
  */
 sds sdstrim(sds s, const char *cset) {
     char *start, *end, *sp, *ep;
@@ -717,24 +736,24 @@ sds sdstrim(sds s, const char *cset) {
  * s = sdsnew("Hello World");
  * sdsrange(s,1,-1); => "ello World"
  */
-void sdsrange(sds s, int start, int end) {
+void sdsrange(sds s, ssize_t start, ssize_t end) {
     size_t newlen, len = sdslen(s);
 
     if (len == 0) return;
     if (start < 0) {
-        start = (int)len+start;                                                 WIN_PORT_FIX /* cast (int) */
+        start = len+start;
         if (start < 0) start = 0;
     }
     if (end < 0) {
-        end = (int)len+end;                                                     WIN_PORT_FIX /* cast (int) */
+        end = len+end;
         if (end < 0) end = 0;
     }
     newlen = (start > end) ? 0 : (end-start)+1;
     if (newlen != 0) {
-        if (start >= (signed)len) {
+        if (start >= (ssize_t)len) {
             newlen = 0;
-        } else if (end >= (signed)len) {
-            end = (int)len-1;                                                   WIN_PORT_FIX /* cast (int) */
+        } else if (end >= (ssize_t)len) {
+            end = len-1;
             newlen = (start > end) ? 0 : (end-start)+1;
         }
     } else {
@@ -747,14 +766,14 @@ void sdsrange(sds s, int start, int end) {
 
 /* Apply tolower() to every character of the sds string 's'. */
 void sdstolower(sds s) {
-    int len = (int)sdslen(s), j;                                                WIN_PORT_FIX /* cast (int) */
+    size_t len = sdslen(s), j;
 
     for (j = 0; j < len; j++) s[j] = tolower(s[j]);
 }
 
 /* Apply toupper() to every character of the sds string 's'. */
 void sdstoupper(sds s) {
-    int len = (int)sdslen(s), j;                                                WIN_PORT_FIX /* cast (int) */
+    size_t len = sdslen(s), j;
 
     for (j = 0; j < len; j++) s[j] = toupper(s[j]);
 }
@@ -778,7 +797,7 @@ int sdscmp(const sds s1, const sds s2) {
     l2 = sdslen(s2);
     minlen = (l1 < l2) ? l1 : l2;
     cmp = memcmp(s1,s2,minlen);
-    if (cmp == 0) return (int)(l1-l2);                                          WIN_PORT_FIX /* cast (int) */
+    if (cmp == 0) return l1>l2? 1: (l1<l2? -1: 0);
     return cmp;
 }
 
@@ -798,8 +817,9 @@ int sdscmp(const sds s1, const sds s2) {
  * requires length arguments. sdssplit() is just the
  * same function but for zero-terminated strings.
  */
-sds *sdssplitlen(const char *s, int len, const char *sep, int seplen, int *count) {
-    int elements = 0, slots = 5, start = 0, j;
+sds *sdssplitlen(const char *s, ssize_t len, const char *sep, int seplen, int *count) {
+    int elements = 0, slots = 5;
+    long start = 0, j;
     sds *tokens;
 
     if (seplen < 1 || len < 0) return NULL;
@@ -875,7 +895,7 @@ sds sdscatrepr(sds s, const char *p, size_t len) {
         case '\a': s = sdscatlen(s,"\\a",2); break;
         case '\b': s = sdscatlen(s,"\\b",2); break;
         default:
-            if (isprint((unsigned char)*p))                                     WIN_PORT_FIX /* cast (unsigned char) */
+            if (isprint(*p))
                 s = sdscatprintf(s,"%c",*p);
             else
                 s = sdscatprintf(s,"\\x%02x",(unsigned char)*p);

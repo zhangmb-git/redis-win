@@ -27,15 +27,6 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef _WIN32
-#include "Win32_Interop/Win32_Portability.h"
-#include "Win32_Interop/win32fixes.h"
-#include "Win32_Interop/Win32_Time.h"
-#include <process.h>    // for getpid
-#include <direct.h>     // for getcwd
-#include <shlwapi.h>    // for PathIsRelative
-#endif
-
 #include "fmacros.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -43,23 +34,24 @@
 #include <ctype.h>
 #include <limits.h>
 #include <math.h>
-POSIX_ONLY(#include <unistd.h>)
-POSIX_ONLY(#include <sys/time.h>)
+#include <unistd.h>
+#include <sys/time.h>
 #include <float.h>
 #include <stdint.h>
 #include <errno.h>
+#include <time.h>
 
 #include "util.h"
-#include "sha1.h"
+#include "sha256.h"
 
 /* Glob-style pattern matching. */
 int stringmatchlen(const char *pattern, int patternLen,
         const char *string, int stringLen, int nocase)
 {
-    while(patternLen) {
+    while(patternLen && stringLen) {
         switch(pattern[0]) {
         case '*':
-            while (pattern[1] == '*') {
+            while (patternLen && pattern[1] == '*') {
                 pattern++;
                 patternLen--;
             }
@@ -75,8 +67,6 @@ int stringmatchlen(const char *pattern, int patternLen,
             return 0; /* no match */
             break;
         case '?':
-            if (stringLen == 0)
-                return 0; /* no match */
             string++;
             stringLen--;
             break;
@@ -93,7 +83,7 @@ int stringmatchlen(const char *pattern, int patternLen,
             }
             match = 0;
             while(1) {
-                if (pattern[0] == '\\') {
+                if (pattern[0] == '\\' && patternLen >= 2) {
                     pattern++;
                     patternLen--;
                     if (pattern[0] == string[0])
@@ -104,7 +94,7 @@ int stringmatchlen(const char *pattern, int patternLen,
                     pattern--;
                     patternLen++;
                     break;
-                } else if (pattern[1] == '-' && patternLen >= 3) {
+                } else if (patternLen >= 3 && pattern[1] == '-') {
                     int start = pattern[0];
                     int end = pattern[2];
                     int c = string[0];
@@ -176,7 +166,23 @@ int stringmatchlen(const char *pattern, int patternLen,
 }
 
 int stringmatch(const char *pattern, const char *string, int nocase) {
-    return stringmatchlen(pattern,(int)strlen(pattern),string,(int)strlen(string),nocase); WIN_PORT_FIX /* cast (int) */
+    return stringmatchlen(pattern,strlen(pattern),string,strlen(string),nocase);
+}
+
+/* Fuzz stringmatchlen() trying to crash it with bad input. */
+int stringmatchlen_fuzz_test(void) {
+    char str[32];
+    char pat[32];
+    int cycles = 10000000;
+    int total_matches = 0;
+    while(cycles--) {
+        int strlen = rand() % sizeof(str);
+        int patlen = rand() % sizeof(pat);
+        for (int j = 0; j < strlen; j++) str[j] = rand() % 128;
+        for (int j = 0; j < patlen; j++) pat[j] = rand() % 128;
+        total_matches += stringmatchlen(pat, patlen, str, strlen, 0);
+    }
+    return total_matches;
 }
 
 /* Convert a string representing an amount of memory into the number of
@@ -186,11 +192,11 @@ int stringmatch(const char *pattern, const char *string, int nocase) {
  * On parsing error, if *err is not NULL, it's set to 1, otherwise it's
  * set to 0. On error the function return value is 0, regardless of the
  * fact 'err' is NULL or not. */
-PORT_LONGLONG memtoll(const char *p, int *err) {
+long long memtoll(const char *p, int *err) {
     const char *u;
     char buf[128];
-    PORT_LONG mul; /* unit multiplier */
-    PORT_LONGLONG val;
+    long mul; /* unit multiplier */
+    long long val;
     unsigned int digits;
 
     if (err) *err = 0;
@@ -218,9 +224,9 @@ PORT_LONGLONG memtoll(const char *p, int *err) {
         return 0;
     }
 
-    /* Copy the digits into a buffer, we'll use strtol() to convert
+    /* Copy the digits into a buffer, we'll use strtoll() to convert
      * the digit (without the unit) into a number. */
-    digits = (unsigned int)(u-p);                                                WIN_PORT_FIX /* cast (unsigned int) */
+    digits = u-p;
     if (digits >= sizeof(buf)) {
         if (err) *err = 1;
         return 0;
@@ -230,7 +236,7 @@ PORT_LONGLONG memtoll(const char *p, int *err) {
 
     char *endptr;
     errno = 0;
-    val = strtol(buf,&endptr,10);
+    val = strtoll(buf,&endptr,10);
     if ((val == 0 && errno == EINVAL) || *endptr != '\0') {
         if (err) *err = 1;
         return 0;
@@ -272,7 +278,7 @@ uint32_t sdigits10(int64_t v) {
     }
 }
 
-/* Convert a PORT_LONGLONG into a string. Returns the number of
+/* Convert a long long into a string. Returns the number of
  * characters needed to represent the number.
  * If the buffer is not big enough to store the string, 0 is returned.
  *
@@ -283,7 +289,7 @@ uint32_t sdigits10(int64_t v) {
  *
  * Modified in order to handle signed integers since the original code was
  * designed for unsigned integers. */
-int ll2string(char* dst, size_t dstlen, PORT_LONGLONG svalue) {
+int ll2string(char *dst, size_t dstlen, long long svalue) {
     static const char digits[201] =
         "0001020304050607080910111213141516171819"
         "2021222324252627282930313233343536373839"
@@ -291,7 +297,7 @@ int ll2string(char* dst, size_t dstlen, PORT_LONGLONG svalue) {
         "6061626364656667686970717273747576777879"
         "8081828384858687888990919293949596979899";
     int negative;
-    PORT_ULONGLONG value;
+    unsigned long long value;
 
     /* The main loop works with 64bit unsigned integers for simplicity, so
      * we convert the number here and remember if it is negative. */
@@ -299,7 +305,7 @@ int ll2string(char* dst, size_t dstlen, PORT_LONGLONG svalue) {
         if (svalue != LLONG_MIN) {
             value = -svalue;
         } else {
-            value = ((PORT_ULONGLONG) LLONG_MAX)+1;
+            value = ((unsigned long long) LLONG_MAX)+1;
         }
         negative = 1;
     } else {
@@ -337,15 +343,25 @@ int ll2string(char* dst, size_t dstlen, PORT_LONGLONG svalue) {
     return length;
 }
 
-/* Convert a string into a PORT_LONGLONG. Returns 1 if the string could be parsed
- * into a (non-overflowing) PORT_LONGLONG, 0 otherwise. The value will be set to
- * the parsed value when appropriate. */
-int string2ll(const char *s, size_t slen, PORT_LONGLONG *value) {
+/* Convert a string into a long long. Returns 1 if the string could be parsed
+ * into a (non-overflowing) long long, 0 otherwise. The value will be set to
+ * the parsed value when appropriate.
+ *
+ * Note that this function demands that the string strictly represents
+ * a long long: no spaces or other characters before or after the string
+ * representing the number are accepted, nor zeroes at the start if not
+ * for the string "0" representing the zero number.
+ *
+ * Because of its strictness, it is safe to use this function to check if
+ * you can convert a string into a long long, and obtain back the string
+ * from the number without any loss in the string representation. */
+int string2ll(const char *s, size_t slen, long long *value) {
     const char *p = s;
     size_t plen = 0;
     int negative = 0;
-    PORT_ULONGLONG v;
+    unsigned long long v;
 
+    /* A zero length string is not a valid number. */
     if (plen == slen)
         return 0;
 
@@ -355,6 +371,8 @@ int string2ll(const char *s, size_t slen, PORT_LONGLONG *value) {
         return 1;
     }
 
+    /* Handle negative numbers: just set a flag and continue like if it
+     * was a positive number. Later convert into negative. */
     if (p[0] == '-') {
         negative = 1;
         p++; plen++;
@@ -368,13 +386,11 @@ int string2ll(const char *s, size_t slen, PORT_LONGLONG *value) {
     if (p[0] >= '1' && p[0] <= '9') {
         v = p[0]-'0';
         p++; plen++;
-    } else if (p[0] == '0' && slen == 1) {
-        *value = 0;
-        return 1;
     } else {
         return 0;
     }
 
+    /* Parse all the other digits, checking for overflow at every step. */
     while (plen < slen && p[0] >= '0' && p[0] <= '9') {
         if (v > (ULLONG_MAX / 10)) /* Overflow. */
             return 0;
@@ -391,8 +407,10 @@ int string2ll(const char *s, size_t slen, PORT_LONGLONG *value) {
     if (plen < slen)
         return 0;
 
+    /* Convert to negative if needed, and do the final overflow check when
+     * converting from unsigned long long to long long. */
     if (negative) {
-        if (v > ((PORT_ULONGLONG)(-(LLONG_MIN+1))+1)) /* Overflow. */
+        if (v > ((unsigned long long)(-(LLONG_MIN+1))+1)) /* Overflow. */
             return 0;
         if (value != NULL) *value = -v;
     } else {
@@ -403,24 +421,98 @@ int string2ll(const char *s, size_t slen, PORT_LONGLONG *value) {
     return 1;
 }
 
-/* Convert a string into a PORT_LONG. Returns 1 if the string could be parsed into a
- * (non-overflowing) PORT_LONG, 0 otherwise. The value will be set to the parsed
+/* Helper function to convert a string to an unsigned long long value.
+ * The function attempts to use the faster string2ll() function inside
+ * Redis: if it fails, strtoull() is used instead. The function returns
+ * 1 if the conversion happened successfully or 0 if the number is
+ * invalid or out of range. */
+int string2ull(const char *s, unsigned long long *value) {
+    long long ll;
+    if (string2ll(s,strlen(s),&ll)) {
+        if (ll < 0) return 0; /* Negative values are out of range. */
+        *value = ll;
+        return 1;
+    }
+    errno = 0;
+    char *endptr = NULL;
+    *value = strtoull(s,&endptr,10);
+    if (errno == EINVAL || errno == ERANGE || !(*s != '\0' && *endptr == '\0'))
+        return 0; /* strtoull() failed. */
+    return 1; /* Conversion done! */
+}
+
+/* Convert a string into a long. Returns 1 if the string could be parsed into a
+ * (non-overflowing) long, 0 otherwise. The value will be set to the parsed
  * value when appropriate. */
-int string2l(const char *s, size_t slen, PORT_LONG *lval) {
-    PORT_LONGLONG llval;
+int string2l(const char *s, size_t slen, long *lval) {
+    long long llval;
 
     if (!string2ll(s,slen,&llval))
         return 0;
 
-    if (llval < PORT_LONG_MIN || llval > PORT_LONG_MAX)
+    if (llval < LONG_MIN || llval > LONG_MAX)
         return 0;
 
-    *lval = (PORT_LONG)llval;
+    *lval = (long)llval;
+    return 1;
+}
+
+/* Convert a string into a double. Returns 1 if the string could be parsed
+ * into a (non-overflowing) double, 0 otherwise. The value will be set to
+ * the parsed value when appropriate.
+ *
+ * Note that this function demands that the string strictly represents
+ * a double: no spaces or other characters before or after the string
+ * representing the number are accepted. */
+int string2ld(const char *s, size_t slen, long double *dp) {
+    char buf[MAX_LONG_DOUBLE_CHARS];
+    long double value;
+    char *eptr;
+
+    if (slen == 0 || slen >= sizeof(buf)) return 0;
+    memcpy(buf,s,slen);
+    buf[slen] = '\0';
+
+    errno = 0;
+    value = strtold(buf, &eptr);
+    if (isspace(buf[0]) || eptr[0] != '\0' ||
+        (size_t)(eptr-buf) != slen ||
+        (errno == ERANGE &&
+            (value == HUGE_VAL || value == -HUGE_VAL || value == 0)) ||
+        errno == EINVAL ||
+        isnan(value))
+        return 0;
+
+    if (dp) *dp = value;
+    return 1;
+}
+
+/* Convert a string into a double. Returns 1 if the string could be parsed
+ * into a (non-overflowing) double, 0 otherwise. The value will be set to
+ * the parsed value when appropriate.
+ *
+ * Note that this function demands that the string strictly represents
+ * a double: no spaces or other characters before or after the string
+ * representing the number are accepted. */
+int string2d(const char *s, size_t slen, double *dp) {
+    errno = 0;
+    char *eptr;
+    *dp = strtod(s, &eptr);
+    if (slen == 0 ||
+        isspace(((const char*)s)[0]) ||
+        (size_t)(eptr-(char*)s) != slen ||
+        (errno == ERANGE &&
+            (*dp == HUGE_VAL || *dp == -HUGE_VAL || *dp == 0)) ||
+        isnan(*dp))
+        return 0;
     return 1;
 }
 
 /* Convert a double to a string representation. Returns the number of bytes
- * required. The representation should always be parsable by strtod(3). */
+ * required. The representation should always be parsable by strtod(3).
+ * This function does not support human-friendly formatting like ld2string
+ * does. It is intended mainly to be used inside t_zset.c when writing scores
+ * into a ziplist representing a sorted set. */
 int d2string(char *buf, size_t len, double value) {
     if (isnan(value)) {
         len = snprintf(buf,len,"nan");
@@ -438,37 +530,97 @@ int d2string(char *buf, size_t len, double value) {
     } else {
 #if (DBL_MANT_DIG >= 52) && (LLONG_MAX == 0x7fffffffffffffffLL)
         /* Check if the float is in a safe range to be casted into a
-         * PORT_LONGLONG. We are assuming that PORT_LONGLONG is 64 bit here.
+         * long long. We are assuming that long long is 64 bit here.
          * Also we are assuming that there are no implementations around where
          * double has precision < 52 bit.
          *
          * Under this assumptions we test if a double is inside an interval
-         * where casting to PORT_LONGLONG is safe. Then using two castings we
+         * where casting to long long is safe. Then using two castings we
          * make sure the decimal part is zero. If all this is true we use
          * integer printing function that is much faster. */
         double min = -4503599627370495; /* (2^52)-1 */
         double max = 4503599627370496; /* -(2^52) */
-        if (value > min && value < max && value == ((double)((PORT_LONGLONG)value)))
-            len = ll2string(buf,len,(PORT_LONGLONG)value);
+        if (value > min && value < max && value == ((double)((long long)value)))
+            len = ll2string(buf,len,(long long)value);
         else
 #endif
             len = snprintf(buf,len,"%.17g",value);
     }
 
-    return (int)len;                                                            WIN_PORT_FIX /* cast (int) */
+    return len;
 }
 
-/* Generate the Redis "Run ID", a SHA1-sized random number that identifies a
- * given execution of Redis, so that if you are talking with an instance
- * having run_id == A, and you reconnect and it has run_id == B, you can be
- * sure that it is either a different instance or it was restarted. */
-void getRandomHexChars(char *p, unsigned int len) {
-    char *charset = "0123456789abcdef";
-    unsigned int j;
+/* Create a string object from a long double.
+ * If mode is humanfriendly it does not use exponential format and trims trailing
+ * zeroes at the end (may result in loss of precision).
+ * If mode is default exp format is used and the output of snprintf()
+ * is not modified (may result in loss of precision).
+ * If mode is hex hexadecimal format is used (no loss of precision)
+ *
+ * The function returns the length of the string or zero if there was not
+ * enough buffer room to store it. */
+int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
+    size_t l = 0;
 
+    if (isinf(value)) {
+        /* Libc in odd systems (Hi Solaris!) will format infinite in a
+         * different way, so better to handle it in an explicit way. */
+        if (len < 5) return 0; /* No room. 5 is "-inf\0" */
+        if (value > 0) {
+            memcpy(buf,"inf",3);
+            l = 3;
+        } else {
+            memcpy(buf,"-inf",4);
+            l = 4;
+        }
+    } else {
+        switch (mode) {
+        case LD_STR_AUTO:
+            l = snprintf(buf,len,"%.17Lg",value);
+            if (l+1 > len) return 0; /* No room. */
+            break;
+        case LD_STR_HEX:
+            l = snprintf(buf,len,"%La",value);
+            if (l+1 > len) return 0; /* No room. */
+            break;
+        case LD_STR_HUMAN:
+            /* We use 17 digits precision since with 128 bit floats that precision
+             * after rounding is able to represent most small decimal numbers in a
+             * way that is "non surprising" for the user (that is, most small
+             * decimal numbers will be represented in a way that when converted
+             * back into a string are exactly the same as what the user typed.) */
+            l = snprintf(buf,len,"%.17Lf",value);
+            if (l+1 > len) return 0; /* No room. */
+            /* Now remove trailing zeroes after the '.' */
+            if (strchr(buf,'.') != NULL) {
+                char *p = buf+l-1;
+                while(*p == '0') {
+                    p--;
+                    l--;
+                }
+                if (*p == '.') l--;
+            }
+            if (l == 2 && buf[0] == '-' && buf[1] == '0') {
+                buf[0] = '0';
+                l = 1;
+            }
+            break;
+        default: return 0; /* Invalid mode. */
+        }
+    }
+    buf[l] = '\0';
+    return l;
+}
+
+/* Get random bytes, attempts to get an initial seed from /dev/urandom and
+ * the uses a one way hash function in counter mode to generate a random
+ * stream. However if /dev/urandom is not available, a weaker seed is used.
+ *
+ * This function is not thread safe, since the state is global. */
+void getRandomBytes(unsigned char *p, size_t len) {
     /* Global state. */
     static int seed_initialized = 0;
-    static unsigned char seed[20]; /* The SHA1 seed, from /dev/urandom. */
+    static unsigned char seed[64]; /* 512 bit internal block size. */
     static uint64_t counter = 0; /* The counter we hash with the seed. */
 
     if (!seed_initialized) {
@@ -477,62 +629,68 @@ void getRandomHexChars(char *p, unsigned int len) {
          * function we just need non-colliding strings, there are no
          * cryptographic security needs. */
         FILE *fp = fopen("/dev/urandom","r");
-        if (fp && fread(seed,sizeof(seed),1,fp) == 1)
+        if (fp == NULL || fread(seed,sizeof(seed),1,fp) != 1) {
+            /* Revert to a weaker seed, and in this case reseed again
+             * at every call.*/
+            for (unsigned int j = 0; j < sizeof(seed); j++) {
+                struct timeval tv;
+                gettimeofday(&tv,NULL);
+                pid_t pid = getpid();
+                seed[j] = tv.tv_sec ^ tv.tv_usec ^ pid ^ (long)fp;
+            }
+        } else {
             seed_initialized = 1;
+        }
         if (fp) fclose(fp);
     }
 
-    if (seed_initialized) {
-        while(len) {
-            unsigned char digest[20];
-            SHA1_CTX ctx;
-            unsigned int copylen = len > 20 ? 20 : len;
+    while(len) {
+        /* This implements SHA256-HMAC. */
+        unsigned char digest[SHA256_BLOCK_SIZE];
+        unsigned char kxor[64];
+        unsigned int copylen =
+            len > SHA256_BLOCK_SIZE ? SHA256_BLOCK_SIZE : len;
 
-            SHA1Init(&ctx);
-            SHA1Update(&ctx, seed, sizeof(seed));
-            SHA1Update(&ctx, (unsigned char*)&counter,sizeof(counter));
-            SHA1Final(digest, &ctx);
-            counter++;
+        /* IKEY: key xored with 0x36. */
+        memcpy(kxor,seed,sizeof(kxor));
+        for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x36;
 
-            memcpy(p,digest,copylen);
-            /* Convert to hex digits. */
-            for (j = 0; j < copylen; j++) p[j] = charset[p[j] & 0x0F];
-            len -= copylen;
-            p += copylen;
-        }
-    } else {
-        /* If we can't read from /dev/urandom, do some reasonable effort
-         * in order to create some entropy, since this function is used to
-         * generate run_id and cluster instance IDs */
-        char *x = p;
-        unsigned int l = len;
-        struct timeval tv;
-        pid_t pid = getpid();
+        /* Obtain HASH(IKEY||MESSAGE). */
+        SHA256_CTX ctx;
+        sha256_init(&ctx);
+        sha256_update(&ctx,kxor,sizeof(kxor));
+        sha256_update(&ctx,(unsigned char*)&counter,sizeof(counter));
+        sha256_final(&ctx,digest);
 
-        /* Use time and PID to fill the initial array. */
-        gettimeofday(&tv,NULL);
-        if (l >= sizeof(tv.tv_usec)) {
-            memcpy(x,&tv.tv_usec,sizeof(tv.tv_usec));
-            l -= sizeof(tv.tv_usec);
-            x += sizeof(tv.tv_usec);
-        }
-        if (l >= sizeof(tv.tv_sec)) {
-            memcpy(x,&tv.tv_sec,sizeof(tv.tv_sec));
-            l -= sizeof(tv.tv_sec);
-            x += sizeof(tv.tv_sec);
-        }
-        if (l >= sizeof(pid)) {
-            memcpy(x,&pid,sizeof(pid));
-            l -= sizeof(pid);
-            x += sizeof(pid);
-        }
-        /* Finally xor it with rand() output, that was already seeded with
-         * time() at startup, and convert to hex digits. */
-        for (j = 0; j < len; j++) {
-            p[j] ^= rand();
-            p[j] = charset[p[j] & 0x0F];
-        }
+        /* OKEY: key xored with 0x5c. */
+        memcpy(kxor,seed,sizeof(kxor));
+        for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x5C;
+
+        /* Obtain HASH(OKEY || HASH(IKEY||MESSAGE)). */
+        sha256_init(&ctx);
+        sha256_update(&ctx,kxor,sizeof(kxor));
+        sha256_update(&ctx,digest,SHA256_BLOCK_SIZE);
+        sha256_final(&ctx,digest);
+
+        /* Increment the counter for the next iteration. */
+        counter++;
+
+        memcpy(p,digest,copylen);
+        len -= copylen;
+        p += copylen;
     }
+}
+
+/* Generate the Redis "Run ID", a SHA1-sized random number that identifies a
+ * given execution of Redis, so that if you are talking with an instance
+ * having run_id == A, and you reconnect and it has run_id == B, you can be
+ * sure that it is either a different instance or it was restarted. */
+void getRandomHexChars(char *p, size_t len) {
+    char *charset = "0123456789abcdef";
+    size_t j;
+
+    getRandomBytes((unsigned char*)p,len);
+    for (j = 0; j < len; j++) p[j] = charset[p[j] & 0x0F];
 }
 
 /* Given the filename, return the absolute path as an SDS string, or NULL
@@ -540,29 +698,8 @@ void getRandomHexChars(char *p, unsigned int len) {
  * already, this will be detected and handled correctly.
  *
  * The function does not try to normalize everything, but only the obvious
- * case of one or more "../" appearning at the start of "filename"
+ * case of one or more "../" appearing at the start of "filename"
  * relative path. */
-#ifdef _WIN32
-sds getAbsolutePath(char *filename) {
-    char fullPath[MAX_PATH];
-    DWORD gfpnResult;
-    sds abspath;
-    sds relpath = sdsnew(filename);
-
-    relpath = sdstrim(relpath, " \r\n\t");
-
-    if (!PathIsRelative(relpath)) return relpath;
-
-    gfpnResult = GetFullPathNameA(relpath, sizeof(fullPath), fullPath, NULL);
-    sdsfree(relpath);
-
-    if (gfpnResult == 0 || gfpnResult > sizeof(fullPath)) {
-        return NULL;
-    }
-    abspath = sdsnew(fullPath);
-    return abspath;
-}
-#else
 sds getAbsolutePath(char *filename) {
     char cwd[1024];
     sds abspath;
@@ -607,7 +744,24 @@ sds getAbsolutePath(char *filename) {
     sdsfree(relpath);
     return abspath;
 }
+
+/*
+ * Gets the proper timezone in a more portable fashion
+ * i.e timezone variables are linux specific.
+ */
+
+unsigned long getTimeZone(void) {
+#ifdef __linux__
+    return timezone;
+#else
+    struct timeval tv;
+    struct timezone tz;
+
+    gettimeofday(&tv, &tz);
+
+    return tz.tz_minuteswest * 60UL;
 #endif
+}
 
 /* Return true if the specified path is just a file basename without any
  * relative or absolute path. This function just checks that no / or \
@@ -622,7 +776,7 @@ int pathIsBaseName(char *path) {
 
 static void test_string2ll(void) {
     char buf[32];
-    PORT_LONGLONG v;
+    long long v;
 
     /* May not start with +. */
     strcpy(buf,"+1");
@@ -677,7 +831,7 @@ static void test_string2ll(void) {
 
 static void test_string2l(void) {
     char buf[32];
-    PORT_LONG v;
+    long v;
 
     /* May not start with +. */
     strcpy(buf,"+1");
@@ -707,17 +861,17 @@ static void test_string2l(void) {
     assert(string2l(buf,strlen(buf),&v) == 1);
     assert(v == -99);
 
-#if PORT_LONG_MAX != LLONG_MAX
+#if LONG_MAX != LLONG_MAX
     strcpy(buf,"-2147483648");
     assert(string2l(buf,strlen(buf),&v) == 1);
-    assert(v == PORT_LONG_MIN);
+    assert(v == LONG_MIN);
 
     strcpy(buf,"-2147483649"); /* overflow */
     assert(string2l(buf,strlen(buf),&v) == 0);
 
     strcpy(buf,"2147483647");
     assert(string2l(buf,strlen(buf),&v) == 1);
-    assert(v == PORT_LONG_MAX);
+    assert(v == LONG_MAX);
 
     strcpy(buf,"2147483648"); /* overflow */
     assert(string2l(buf,strlen(buf),&v) == 0);
@@ -726,7 +880,7 @@ static void test_string2l(void) {
 
 static void test_ll2string(void) {
     char buf[32];
-    PORT_LONGLONG v;
+    long long v;
     int sz;
 
     v = 0;

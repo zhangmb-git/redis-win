@@ -13,14 +13,10 @@
 
 /* The following defines are amount of time, sometimes expressed as
  * multiplicators of the node timeout value (when ending with MULT). */
-#define CLUSTER_DEFAULT_NODE_TIMEOUT 15000
-#define CLUSTER_DEFAULT_SLAVE_VALIDITY 10 /* Slave max data age factor. */
-#define CLUSTER_DEFAULT_REQUIRE_FULL_COVERAGE 1
 #define CLUSTER_FAIL_REPORT_VALIDITY_MULT 2 /* Fail report validity. */
 #define CLUSTER_FAIL_UNDO_TIME_MULT 2 /* Undo fail if master is back. */
 #define CLUSTER_FAIL_UNDO_TIME_ADD 10 /* Some additional time. */
 #define CLUSTER_FAILOVER_DELAY 5 /* Seconds */
-#define CLUSTER_DEFAULT_MIGRATION_BARRIER 1
 #define CLUSTER_MF_TIMEOUT 5000 /* Milliseconds to do a manual failover. */
 #define CLUSTER_MF_PAUSE_MULT 2 /* Master pause manual failover mult. */
 #define CLUSTER_SLAVE_MIGRATION_DELAY 5000 /* Delay for slave migration. */
@@ -33,13 +29,14 @@
 #define CLUSTER_REDIR_MOVED 4         /* -MOVED redirection required. */
 #define CLUSTER_REDIR_DOWN_STATE 5    /* -CLUSTERDOWN, global state. */
 #define CLUSTER_REDIR_DOWN_UNBOUND 6  /* -CLUSTERDOWN, unbound slot. */
+#define CLUSTER_REDIR_DOWN_RO_STATE 7 /* -CLUSTERDOWN, allow reads. */
 
 struct clusterNode;
 
 /* clusterLink encapsulates everything needed to talk with a remote node. */
 typedef struct clusterLink {
     mstime_t ctime;             /* Link creation time */
-    int fd;                     /* TCP socket file descriptor */
+    connection *conn;           /* Connection to remote node */
     sds sndbuf;                 /* Packet send buffer */
     sds rcvbuf;                 /* Packet reception buffer */
     struct clusterNode *node;   /* Node related to this link if any, or NULL */
@@ -55,6 +52,7 @@ typedef struct clusterLink {
 #define CLUSTER_NODE_NOADDR   64  /* We don't know the address of this node */
 #define CLUSTER_NODE_MEET 128     /* Send a MEET message to this node */
 #define CLUSTER_NODE_MIGRATE_TO 256 /* Master elegible for replica migration. */
+#define CLUSTER_NODE_NOFAILOVER 512 /* Slave will not try to failver. */
 #define CLUSTER_NODE_NULL_NAME "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
 
 #define nodeIsMaster(n) ((n)->flags & CLUSTER_NODE_MASTER)
@@ -64,6 +62,7 @@ typedef struct clusterLink {
 #define nodeWithoutAddr(n) ((n)->flags & CLUSTER_NODE_NOADDR)
 #define nodeTimedOut(n) ((n)->flags & CLUSTER_NODE_PFAIL)
 #define nodeFailed(n) ((n)->flags & CLUSTER_NODE_FAIL)
+#define nodeCantFailover(n) ((n)->flags & CLUSTER_NODE_NOFAILOVER)
 
 /* Reasons why a slave is not able to failover. */
 #define CLUSTER_CANT_FAILOVER_NONE 0
@@ -72,6 +71,37 @@ typedef struct clusterLink {
 #define CLUSTER_CANT_FAILOVER_EXPIRED 3
 #define CLUSTER_CANT_FAILOVER_WAITING_VOTES 4
 #define CLUSTER_CANT_FAILOVER_RELOG_PERIOD (60*5) /* seconds. */
+
+/* clusterState todo_before_sleep flags. */
+#define CLUSTER_TODO_HANDLE_FAILOVER (1<<0)
+#define CLUSTER_TODO_UPDATE_STATE (1<<1)
+#define CLUSTER_TODO_SAVE_CONFIG (1<<2)
+#define CLUSTER_TODO_FSYNC_CONFIG (1<<3)
+
+/* Message types.
+ *
+ * Note that the PING, PONG and MEET messages are actually the same exact
+ * kind of packet. PONG is the reply to ping, in the exact format as a PING,
+ * while MEET is a special PING that forces the receiver to add the sender
+ * as a node (if it is not already in the list). */
+#define CLUSTERMSG_TYPE_PING 0          /* Ping */
+#define CLUSTERMSG_TYPE_PONG 1          /* Pong (reply to Ping) */
+#define CLUSTERMSG_TYPE_MEET 2          /* Meet "let's join" message */
+#define CLUSTERMSG_TYPE_FAIL 3          /* Mark node xxx as failing */
+#define CLUSTERMSG_TYPE_PUBLISH 4       /* Pub/Sub Publish propagation */
+#define CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST 5 /* May I failover? */
+#define CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK 6     /* Yes, you have my vote */
+#define CLUSTERMSG_TYPE_UPDATE 7        /* Another node slots configuration */
+#define CLUSTERMSG_TYPE_MFSTART 8       /* Pause clients for manual failover */
+#define CLUSTERMSG_TYPE_MODULE 9        /* Module cluster API message. */
+#define CLUSTERMSG_TYPE_COUNT 10        /* Total number of message types. */
+
+/* Flags that a module can set in order to prevent certain Redis Cluster
+ * features to be enabled. Useful when implementing a different distributed
+ * system on top of Redis Cluster message bus, using modules. */
+#define CLUSTER_MODULE_FLAG_NONE 0
+#define CLUSTER_MODULE_FLAG_NO_FAILOVER (1<<1)
+#define CLUSTER_MODULE_FLAG_NO_REDIRECTION (1<<2)
 
 /* This structure represent elements of node->fail_reports. */
 typedef struct clusterNodeFailReport {
@@ -94,13 +124,15 @@ typedef struct clusterNode {
                                     tables. */
     mstime_t ping_sent;      /* Unix time we sent latest ping */
     mstime_t pong_received;  /* Unix time we received the pong */
+    mstime_t data_received;  /* Unix time we received any data */
     mstime_t fail_time;      /* Unix time when FAIL flag was set */
     mstime_t voted_time;     /* Last time we voted for a slave of this master */
     mstime_t repl_offset_time;  /* Unix time we received offset for this node */
     mstime_t orphaned_time;     /* Starting time of orphaned master condition */
-    PORT_LONGLONG repl_offset;      /* Last known repl offset for this node. */
+    long long repl_offset;      /* Last known repl offset for this node. */
     char ip[NET_IP_STR_LEN];  /* Latest known IP address of this node */
-    int port;                   /* Latest known port of this node */
+    int port;                   /* Latest known clients port of this node */
+    int cport;                  /* Latest known cluster port of this node. */
     clusterLink *link;          /* TCP/IP link with this node */
     list *fail_reports;         /* List of nodes signaling this as failing */
 } clusterNode;
@@ -115,7 +147,8 @@ typedef struct clusterState {
     clusterNode *migrating_slots_to[CLUSTER_SLOTS];
     clusterNode *importing_slots_from[CLUSTER_SLOTS];
     clusterNode *slots[CLUSTER_SLOTS];
-    zskiplist *slots_to_keys;
+    uint64_t slots_keys_count[CLUSTER_SLOTS];
+    rax *slots_to_keys;
     /* The following fields are used to take the slave state on elections. */
     mstime_t failover_auth_time; /* Time of previous or next election. */
     int failover_auth_count;    /* Number of votes received so far. */
@@ -130,38 +163,21 @@ typedef struct clusterState {
     /* Manual failover state of master. */
     clusterNode *mf_slave;      /* Slave performing the manual failover. */
     /* Manual failover state of slave. */
-    PORT_LONGLONG mf_master_offset; /* Master offset the slave needs to start MF
+    long long mf_master_offset; /* Master offset the slave needs to start MF
                                    or zero if stil not received. */
     int mf_can_start;           /* If non-zero signal that the manual failover
                                    can start requesting masters vote. */
     /* The followign fields are used by masters to take state on elections. */
     uint64_t lastVoteEpoch;     /* Epoch of the last vote granted. */
     int todo_before_sleep; /* Things to do in clusterBeforeSleep(). */
-    PORT_LONGLONG stats_bus_messages_sent;  /* Num of msg sent via cluster bus. */
-    PORT_LONGLONG stats_bus_messages_received; /* Num of msg rcvd via cluster bus.*/
+    /* Messages received and sent by type. */
+    long long stats_bus_messages_sent[CLUSTERMSG_TYPE_COUNT];
+    long long stats_bus_messages_received[CLUSTERMSG_TYPE_COUNT];
+    long long stats_pfail_nodes;    /* Number of nodes in PFAIL status,
+                                       excluding nodes without address. */
 } clusterState;
 
-/* clusterState todo_before_sleep flags. */
-#define CLUSTER_TODO_HANDLE_FAILOVER (1<<0)
-#define CLUSTER_TODO_UPDATE_STATE (1<<1)
-#define CLUSTER_TODO_SAVE_CONFIG (1<<2)
-#define CLUSTER_TODO_FSYNC_CONFIG (1<<3)
-
 /* Redis cluster messages header */
-
-/* Note that the PING, PONG and MEET messages are actually the same exact
- * kind of packet. PONG is the reply to ping, in the exact format as a PING,
- * while MEET is a special PING that forces the receiver to add the sender
- * as a node (if it is not already in the list). */
-#define CLUSTERMSG_TYPE_PING 0          /* Ping */
-#define CLUSTERMSG_TYPE_PONG 1          /* Pong (reply to Ping) */
-#define CLUSTERMSG_TYPE_MEET 2          /* Meet "let's join" message */
-#define CLUSTERMSG_TYPE_FAIL 3          /* Mark node xxx as failing */
-#define CLUSTERMSG_TYPE_PUBLISH 4       /* Pub/Sub Publish propagation */
-#define CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST 5 /* May I failover? */
-#define CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK 6     /* Yes, you have my vote */
-#define CLUSTERMSG_TYPE_UPDATE 7        /* Another node slots configuration */
-#define CLUSTERMSG_TYPE_MFSTART 8       /* Pause clients for manual failover */
 
 /* Initially we don't know our "name", but we'll find it once we connect
  * to the first node, using the getsockname() function. Then we'll use this
@@ -171,10 +187,10 @@ typedef struct {
     uint32_t ping_sent;
     uint32_t pong_received;
     char ip[NET_IP_STR_LEN];  /* IP address last time it was seen */
-    uint16_t port;              /* port last time it was seen */
+    uint16_t port;              /* base port last time it was seen */
+    uint16_t cport;             /* cluster port last time it was seen */
     uint16_t flags;             /* node->flags copy */
-    uint16_t notused1;          /* Some room for future improvements. */
-    uint32_t notused2;
+    uint32_t notused1;
 } clusterMsgDataGossip;
 
 typedef struct {
@@ -184,10 +200,7 @@ typedef struct {
 typedef struct {
     uint32_t channel_len;
     uint32_t message_len;
-    /* We can't reclare bulk_data as bulk_data[] since this structure is
-     * nested. The 8 bytes are removed from the count during the message
-     * length computation. */
-    unsigned char bulk_data[8];
+    unsigned char bulk_data[8]; /* 8 bytes just as placeholder. */
 } clusterMsgDataPublish;
 
 typedef struct {
@@ -195,6 +208,13 @@ typedef struct {
     char nodename[CLUSTER_NAMELEN]; /* Name of the slots owner. */
     unsigned char slots[CLUSTER_SLOTS/8]; /* Slots bitmap. */
 } clusterMsgDataUpdate;
+
+typedef struct {
+    uint64_t module_id;     /* ID of the sender module. */
+    uint32_t len;           /* ID of the sender module. */
+    uint8_t type;           /* Type from 0 to 255. */
+    unsigned char bulk_data[3]; /* 3 bytes just as placeholder. */
+} clusterMsgModule;
 
 union clusterMsgData {
     /* PING, MEET and PONG */
@@ -217,15 +237,20 @@ union clusterMsgData {
     struct {
         clusterMsgDataUpdate nodecfg;
     } update;
+
+    /* MODULE */
+    struct {
+        clusterMsgModule msg;
+    } module;
 };
 
-#define CLUSTER_PROTO_VER 0 /* Cluster bus protocol version. */
+#define CLUSTER_PROTO_VER 1 /* Cluster bus protocol version. */
 
 typedef struct {
-    char sig[4];        /* Siganture "RCmb" (Redis Cluster message bus). */
+    char sig[4];        /* Signature "RCmb" (Redis Cluster message bus). */
     uint32_t totlen;    /* Total length of this message */
-    uint16_t ver;       /* Protocol version, currently set to 0. */
-    uint16_t notused0;  /* 2 bytes not used. */
+    uint16_t ver;       /* Protocol version, currently set to 1. */
+    uint16_t port;      /* TCP base port number. */
     uint16_t type;      /* Message type */
     uint16_t count;     /* Only used for some kind of messages. */
     uint64_t currentEpoch;  /* The epoch accordingly to the sending node. */
@@ -237,9 +262,10 @@ typedef struct {
     char sender[CLUSTER_NAMELEN]; /* Name of the sender node */
     unsigned char myslots[CLUSTER_SLOTS/8];
     char slaveof[CLUSTER_NAMELEN];
-    char notused1[32];  /* 32 bytes reserved for future usage. */
-    uint16_t port;      /* Sender TCP base port */
-    uint16_t flags;     /* Sender node flags */
+    char myip[NET_IP_STR_LEN];    /* Sender IP, if not all zeroed. */
+    char notused1[34];  /* 34 bytes reserved for future usage. */
+    uint16_t cport;      /* Sender TCP cluster bus port */
+    uint16_t flags;      /* Sender node flags */
     unsigned char state; /* Cluster state from the POV of the sender */
     unsigned char mflags[3]; /* Message flags: CLUSTERMSG_FLAG[012]_... */
     union clusterMsgData data;
@@ -257,5 +283,6 @@ typedef struct {
 clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, int argc, int *hashslot, int *ask);
 int clusterRedirectBlockedClientIfNeeded(client *c);
 void clusterRedirectClient(client *c, clusterNode *n, int hashslot, int error_code);
+unsigned long getClusterConnectionsCount(void);
 
 #endif /* __CLUSTER_H */

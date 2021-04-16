@@ -70,6 +70,12 @@ static const size_t optimization_level[] = {4096, 8192, 16384, 32768, 65536};
     } while (0);
 #endif
 
+/* Bookmarks forward declarations */
+#define QL_MAX_BM ((1 << QL_BM_BITS)-1)
+quicklistBookmark *_quicklistBookmarkFindByName(quicklist *ql, const char *name);
+quicklistBookmark *_quicklistBookmarkFindByNode(quicklist *ql, quicklistNode *node);
+void _quicklistBookmarkDelete(quicklist *ql, quicklistBookmark *bm);
+
 /* Simple way to give quicklistEntry structs default values with one call. */
 #define initEntry(e)                                                           \
     do {                                                                       \
@@ -100,10 +106,11 @@ quicklist *quicklistCreate(void) {
     quicklist->count = 0;
     quicklist->compress = 0;
     quicklist->fill = -2;
+    quicklist->bookmark_count = 0;
     return quicklist;
 }
 
-#define COMPRESS_MAX (1 << 16)
+#define COMPRESS_MAX ((1 << QL_COMP_BITS)-1)
 void quicklistSetCompressDepth(quicklist *quicklist, int compress) {
     if (compress > COMPRESS_MAX) {
         compress = COMPRESS_MAX;
@@ -113,7 +120,7 @@ void quicklistSetCompressDepth(quicklist *quicklist, int compress) {
     quicklist->compress = compress;
 }
 
-#define FILL_MAX (1 << 15)
+#define FILL_MAX ((1 << (QL_FILL_BITS-1))-1)
 void quicklistSetFill(quicklist *quicklist, int fill) {
     if (fill > FILL_MAX) {
         fill = FILL_MAX;
@@ -149,11 +156,11 @@ REDIS_STATIC quicklistNode *quicklistCreateNode(void) {
 }
 
 /* Return cached quicklist count */
-unsigned int quicklistCount(quicklist *ql) { return (unsigned int)(ql->count); } WIN_PORT_FIX /* cast (unsigned int) */
+unsigned long quicklistCount(const quicklist *ql) { return ql->count; }
 
 /* Free entire quicklist. */
 void quicklistRelease(quicklist *quicklist) {
-    PORT_ULONG len;
+    unsigned long len;
     quicklistNode *current, *next;
 
     current = quicklist->head;
@@ -169,6 +176,7 @@ void quicklistRelease(quicklist *quicklist) {
         quicklist->len--;
         current = next;
     }
+    quicklistBookmarksClear(quicklist);
     zfree(quicklist);
 }
 
@@ -438,7 +446,7 @@ REDIS_STATIC int _quicklistNodeAllowInsert(const quicklistNode *node,
         ziplist_overhead += 5;
 
     /* new_sz overestimates if 'sz' encodes to an integer type */
-    unsigned int new_sz = (unsigned int)(node->sz + sz + ziplist_overhead);     WIN_PORT_FIX /* cast (unsigned int) */
+    unsigned int new_sz = node->sz + sz + ziplist_overhead;
     if (likely(_quicklistNodeSizeMeetsOptimizationRequirement(new_sz, fill)))
         return 1;
     else if (!sizeMeetsSafetyLimit(new_sz))
@@ -543,7 +551,7 @@ quicklist *quicklistAppendValuesFromZiplist(quicklist *quicklist,
                                             unsigned char *zl) {
     unsigned char *value;
     unsigned int sz;
-    PORT_LONGLONG longval;
+    long long longval;
     char longstr[32] = {0};
 
     unsigned char *p = ziplistIndex(zl, 0);
@@ -578,6 +586,15 @@ quicklist *quicklistCreateFromZiplist(int fill, int compress,
 
 REDIS_STATIC void __quicklistDelNode(quicklist *quicklist,
                                      quicklistNode *node) {
+    /* Update the bookmark if any */
+    quicklistBookmark *bm = _quicklistBookmarkFindByNode(quicklist, node);
+    if (bm) {
+        bm->node = node->next;
+        /* if the bookmark was to the last node, delete it. */
+        if (!bm->node)
+            _quicklistBookmarkDelete(quicklist, bm);
+    }
+
     if (node->next)
         node->next->prev = node->prev;
     if (node->prev)
@@ -664,13 +681,14 @@ void quicklistDelEntry(quicklistIter *iter, quicklistEntry *entry) {
  *
  * Returns 1 if replace happened.
  * Returns 0 if replace failed and no changes happened. */
-int quicklistReplaceAtIndex(quicklist *quicklist, PORT_LONG index, void *data,
+int quicklistReplaceAtIndex(quicklist *quicklist, long index, void *data,
                             int sz) {
     quicklistEntry entry;
     if (likely(quicklistIndex(quicklist, index, &entry))) {
         /* quicklistIndex provides an uncompressed node */
         entry.node->zl = ziplistDelete(entry.node->zl, &entry.zi);
         entry.node->zl = ziplistInsert(entry.node->zl, entry.zi, data, sz);
+        quicklistNodeUpdateSz(entry.node);
         quicklistCompress(quicklist, entry.node);
         return 1;
     } else {
@@ -954,17 +972,17 @@ void quicklistInsertAfter(quicklist *quicklist, quicklistEntry *entry,
  * have to be careful about tracking where we start and end.
  *
  * Returns 1 if entries were deleted, 0 if nothing was deleted. */
-int quicklistDelRange(quicklist *quicklist, const PORT_LONG start,
-                      const PORT_LONG count) {
+int quicklistDelRange(quicklist *quicklist, const long start,
+                      const long count) {
     if (count <= 0)
         return 0;
 
-    PORT_ULONG extent = count; /* range is inclusive of start position */
+    unsigned long extent = count; /* range is inclusive of start position */
 
     if (start >= 0 && extent > (quicklist->count - start)) {
         /* if requesting delete more elements than exist, limit to list size. */
         extent = quicklist->count - start;
-    } else if (start < 0 && extent > (PORT_ULONG)(-start)) {
+    } else if (start < 0 && extent > (unsigned long)(-start)) {
         /* else, if at negative offset, limit max size to rest of list. */
         extent = -start; /* c.f. LREM -29 29; just delete until end. */
     }
@@ -981,7 +999,7 @@ int quicklistDelRange(quicklist *quicklist, const PORT_LONG start,
     while (extent) {
         quicklistNode *next = node->next;
 
-        PORT_ULONG del;
+        unsigned long del;
         int delete_entire_node = 0;
         if (entry.offset == 0 && extent >= node->count) {
             /* If we are deleting more than the count of this node, we
@@ -1069,7 +1087,7 @@ quicklistIter *quicklistGetIterator(const quicklist *quicklist, int direction) {
  * return nodes in 'direction' direction. */
 quicklistIter *quicklistGetIteratorAtIdx(const quicklist *quicklist,
                                          const int direction,
-                                         const PORT_LONGLONG idx) {
+                                         const long long idx) {
     quicklistEntry entry;
 
     if (quicklistIndex(quicklist, idx, &entry)) {
@@ -1191,12 +1209,12 @@ quicklist *quicklistDup(quicklist *orig) {
          current = current->next) {
         quicklistNode *node = quicklistCreateNode();
 
-        if (node->encoding == QUICKLIST_NODE_ENCODING_LZF) {
-            quicklistLZF *lzf = (quicklistLZF *)node->zl;
+        if (current->encoding == QUICKLIST_NODE_ENCODING_LZF) {
+            quicklistLZF *lzf = (quicklistLZF *)current->zl;
             size_t lzf_sz = sizeof(*lzf) + lzf->sz;
             node->zl = zmalloc(lzf_sz);
             memcpy(node->zl, current->zl, lzf_sz);
-        } else if (node->encoding == QUICKLIST_NODE_ENCODING_RAW) {
+        } else if (current->encoding == QUICKLIST_NODE_ENCODING_RAW) {
             node->zl = zmalloc(current->sz);
             memcpy(node->zl, current->zl, current->sz);
         }
@@ -1221,11 +1239,11 @@ quicklist *quicklistDup(quicklist *orig) {
  *
  * Returns 1 if element found
  * Returns 0 if element not found */
-int quicklistIndex(const quicklist *quicklist, const PORT_LONGLONG idx,
+int quicklistIndex(const quicklist *quicklist, const long long idx,
                    quicklistEntry *entry) {
     quicklistNode *n;
-    PORT_ULONGLONG accum = 0;
-    PORT_ULONGLONG index;
+    unsigned long long accum = 0;
+    unsigned long long index;
     int forward = idx < 0 ? 0 : 1; /* < 0 -> reverse, 0+ -> forward */
 
     initEntry(entry);
@@ -1285,7 +1303,7 @@ void quicklistRotate(quicklist *quicklist) {
     /* First, get the tail entry */
     unsigned char *p = ziplistIndex(quicklist->tail->zl, -1);
     unsigned char *value;
-    PORT_LONGLONG longval;
+    long long longval;
     unsigned int sz;
     char longstr[32] = {0};
     ziplistGet(p, &value, &sz, &longval);
@@ -1314,19 +1332,19 @@ void quicklistRotate(quicklist *quicklist) {
 /* pop from quicklist and return result in 'data' ptr.  Value of 'data'
  * is the return value of 'saver' function pointer if the data is NOT a number.
  *
- * If the quicklist element is a PORT_LONGLONG, then the return value is returned in
+ * If the quicklist element is a long long, then the return value is returned in
  * 'sval'.
  *
  * Return value of 0 means no elements available.
  * Return value of 1 means check 'data' and 'sval' for values.
  * If 'data' is set, use 'data' and 'sz'.  Otherwise, use 'sval'. */
 int quicklistPopCustom(quicklist *quicklist, int where, unsigned char **data,
-                       unsigned int *sz, PORT_LONGLONG *sval,
+                       unsigned int *sz, long long *sval,
                        void *(*saver)(unsigned char *data, unsigned int sz)) {
     unsigned char *p;
     unsigned char *vstr;
     unsigned int vlen;
-    PORT_LONGLONG vlong;
+    long long vlong;
     int pos = (where == QUICKLIST_HEAD) ? 0 : -1;
 
     if (quicklist->count == 0)
@@ -1382,10 +1400,10 @@ REDIS_STATIC void *_quicklistSaver(unsigned char *data, unsigned int sz) {
  *
  * Returns malloc'd value from quicklist */
 int quicklistPop(quicklist *quicklist, int where, unsigned char **data,
-                 unsigned int *sz, PORT_LONGLONG *slong) {
+                 unsigned int *sz, long long *slong) {
     unsigned char *vstr;
     unsigned int vlen;
-    PORT_LONGLONG vlong;
+    long long vlong;
     if (quicklist->count == 0)
         return 0;
     int ret = quicklistPopCustom(quicklist, where, &vstr, &vlen, &vlong,
@@ -1407,6 +1425,87 @@ void quicklistPush(quicklist *quicklist, void *value, const size_t sz,
     } else if (where == QUICKLIST_TAIL) {
         quicklistPushTail(quicklist, value, sz);
     }
+}
+
+/* Create or update a bookmark in the list which will be updated to the next node
+ * automatically when the one referenced gets deleted.
+ * Returns 1 on success (creation of new bookmark or override of an existing one).
+ * Returns 0 on failure (reached the maximum supported number of bookmarks).
+ * NOTE: use short simple names, so that string compare on find is quick.
+ * NOTE: bookmakrk creation may re-allocate the quicklist, so the input pointer
+         may change and it's the caller responsibilty to update the reference.
+ */
+int quicklistBookmarkCreate(quicklist **ql_ref, const char *name, quicklistNode *node) {
+    quicklist *ql = *ql_ref;
+    if (ql->bookmark_count >= QL_MAX_BM)
+        return 0;
+    quicklistBookmark *bm = _quicklistBookmarkFindByName(ql, name);
+    if (bm) {
+        bm->node = node;
+        return 1;
+    }
+    ql = zrealloc(ql, sizeof(quicklist) + (ql->bookmark_count+1) * sizeof(quicklistBookmark));
+    *ql_ref = ql;
+    ql->bookmarks[ql->bookmark_count].node = node;
+    ql->bookmarks[ql->bookmark_count].name = zstrdup(name);
+    ql->bookmark_count++;
+    return 1;
+}
+
+/* Find the quicklist node referenced by a named bookmark.
+ * When the bookmarked node is deleted the bookmark is updated to the next node,
+ * and if that's the last node, the bookmark is deleted (so find returns NULL). */
+quicklistNode *quicklistBookmarkFind(quicklist *ql, const char *name) {
+    quicklistBookmark *bm = _quicklistBookmarkFindByName(ql, name);
+    if (!bm) return NULL;
+    return bm->node;
+}
+
+/* Delete a named bookmark.
+ * returns 0 if bookmark was not found, and 1 if deleted.
+ * Note that the bookmark memory is not freed yet, and is kept for future use. */
+int quicklistBookmarkDelete(quicklist *ql, const char *name) {
+    quicklistBookmark *bm = _quicklistBookmarkFindByName(ql, name);
+    if (!bm)
+        return 0;
+    _quicklistBookmarkDelete(ql, bm);
+    return 1;
+}
+
+quicklistBookmark *_quicklistBookmarkFindByName(quicklist *ql, const char *name) {
+    unsigned i;
+    for (i=0; i<ql->bookmark_count; i++) {
+        if (!strcmp(ql->bookmarks[i].name, name)) {
+            return &ql->bookmarks[i];
+        }
+    }
+    return NULL;
+}
+
+quicklistBookmark *_quicklistBookmarkFindByNode(quicklist *ql, quicklistNode *node) {
+    unsigned i;
+    for (i=0; i<ql->bookmark_count; i++) {
+        if (ql->bookmarks[i].node == node) {
+            return &ql->bookmarks[i];
+        }
+    }
+    return NULL;
+}
+
+void _quicklistBookmarkDelete(quicklist *ql, quicklistBookmark *bm) {
+    int index = bm - ql->bookmarks;
+    zfree(bm->name);
+    ql->bookmark_count--;
+    memmove(bm, bm+1, (ql->bookmark_count - index)* sizeof(*bm));
+    /* NOTE: We do not shrink (realloc) the quicklist yet (to avoid resonance,
+     * it may be re-used later (a call to realloc may NOP). */
+}
+
+void quicklistBookmarksClear(quicklist *ql) {
+    while (ql->bookmark_count)
+        zfree(ql->bookmarks[--ql->bookmark_count].name);
+    /* NOTE: We do not shrink (realloc) the quick list. main use case for this
+     * function is just before releasing the allocation. */
 }
 
 /* The rest of this file is test cases and test helpers. */
@@ -1461,18 +1560,18 @@ static void ql_info(quicklist *ql) {
 }
 
 /* Return the UNIX time in microseconds */
-static PORT_LONGLONG ustime(void) {
+static long long ustime(void) {
     struct timeval tv;
-    PORT_LONGLONG ust;
+    long long ust;
 
     gettimeofday(&tv, NULL);
-    ust = ((PORT_LONGLONG)tv.tv_sec) * 1000000;
+    ust = ((long long)tv.tv_sec) * 1000000;
     ust += tv.tv_usec;
     return ust;
 }
 
 /* Return the UNIX time in milliseconds */
-static PORT_LONGLONG mstime(void) { return ustime() / 1000; }
+static long long mstime(void) { return ustime() / 1000; }
 
 /* Iterate over an entire quicklist.
  * Print the list if 'print' == 1.
@@ -1620,11 +1719,11 @@ int quicklistTest(int argc, char *argv[]) {
 
     int options[] = {0, 1, 2, 3, 4, 5, 6, 10};
     size_t option_count = sizeof(options) / sizeof(*options);
-    PORT_LONGLONG runtime[option_count];
+    long long runtime[option_count];
 
     for (int _i = 0; _i < (int)option_count; _i++) {
         printf("Testing Option %d\n", options[_i]);
-        PORT_LONGLONG start = mstime();
+        long long start = mstime();
 
         TEST("create list") {
             quicklist *ql = quicklistNew(-2, options[_i]);
@@ -1635,7 +1734,7 @@ int quicklistTest(int argc, char *argv[]) {
         TEST("add to tail of empty list") {
             quicklist *ql = quicklistNew(-2, options[_i]);
             quicklistPushTail(ql, "hello", 6);
-            /* 1 for head and 1 for tail beacuse 1 node = head = tail */
+            /* 1 for head and 1 for tail because 1 node = head = tail */
             ql_verify(ql, 1, 1, 1, 1);
             quicklistRelease(ql);
         }
@@ -1643,7 +1742,7 @@ int quicklistTest(int argc, char *argv[]) {
         TEST("add to head of empty list") {
             quicklist *ql = quicklistNew(-2, options[_i]);
             quicklistPushHead(ql, "hello", 6);
-            /* 1 for head and 1 for tail beacuse 1 node = head = tail */
+            /* 1 for head and 1 for tail because 1 node = head = tail */
             ql_verify(ql, 1, 1, 1, 1);
             quicklistRelease(ql);
         }
@@ -1761,7 +1860,7 @@ int quicklistTest(int argc, char *argv[]) {
             quicklistPushHead(ql, populate, 32);
             unsigned char *data;
             unsigned int sz;
-            PORT_LONGLONG lv;
+            long long lv;
             ql_info(ql);
             quicklistPop(ql, QUICKLIST_HEAD, &data, &sz, &lv);
             assert(data != NULL);
@@ -1779,7 +1878,7 @@ int quicklistTest(int argc, char *argv[]) {
             quicklistPushHead(ql, "55513", 5);
             unsigned char *data;
             unsigned int sz;
-            PORT_LONGLONG lv;
+            long long lv;
             ql_info(ql);
             quicklistPop(ql, QUICKLIST_HEAD, &data, &sz, &lv);
             assert(data == NULL);
@@ -1796,7 +1895,7 @@ int quicklistTest(int argc, char *argv[]) {
             for (int i = 0; i < 500; i++) {
                 unsigned char *data;
                 unsigned int sz;
-                PORT_LONGLONG lv;
+                long long lv;
                 int ret = quicklistPop(ql, QUICKLIST_HEAD, &data, &sz, &lv);
                 assert(ret == 1);
                 assert(data != NULL);
@@ -1817,7 +1916,7 @@ int quicklistTest(int argc, char *argv[]) {
             for (int i = 0; i < 5000; i++) {
                 unsigned char *data;
                 unsigned int sz;
-                PORT_LONGLONG lv;
+                long long lv;
                 int ret = quicklistPop(ql, QUICKLIST_HEAD, &data, &sz, &lv);
                 if (i < 500) {
                     assert(ret == 1);
@@ -2240,7 +2339,7 @@ int quicklistTest(int argc, char *argv[]) {
             quicklist *ql = quicklistNew(-2, options[_i]);
             quicklistSetFill(ql, 32);
             char num[32];
-            PORT_LONGLONG nums[5000];
+            long long nums[5000];
             for (int i = 0; i < 5000; i++) {
                 nums[i] = -5157318210846258176 + i;
                 int sz = ll2string(num, sizeof(num), nums[i]);
@@ -2404,7 +2503,7 @@ int quicklistTest(int argc, char *argv[]) {
                       options[_i]) {
                 quicklist *ql = quicklistNew(f, options[_i]);
                 char num[32];
-                PORT_LONGLONG nums[5000];
+                long long nums[5000];
                 for (int i = 0; i < 760; i++) {
                     nums[i] = -5157318210846258176 + i;
                     int sz = ll2string(num, sizeof(num), nums[i]);
@@ -2431,7 +2530,7 @@ int quicklistTest(int argc, char *argv[]) {
                       options[_i]) {
                 quicklist *ql = quicklistNew(f, options[_i]);
                 char num[32];
-                PORT_LONGLONG nums[5000];
+                long long nums[5000];
                 for (int i = 0; i < 32; i++) {
                     nums[i] = -5157318210846258176 + i;
                     int sz = ll2string(num, sizeof(num), nums[i]);
@@ -2463,7 +2562,7 @@ int quicklistTest(int argc, char *argv[]) {
                  * integers don't compress and the check always fails. */
                 quicklist *ql = quicklistNew(f, QUICKLIST_NOCOMPRESS);
                 char num[32];
-                PORT_LONGLONG nums[5000];
+                long long nums[5000];
                 for (int i = 0; i < 33; i++) {
                     nums[i] = i;
                     int sz = ll2string(num, sizeof(num), nums[i]);
@@ -2508,7 +2607,7 @@ int quicklistTest(int argc, char *argv[]) {
                       options[_i]) {
                 quicklist *ql = quicklistNew(f, options[_i]);
                 char num[32];
-                PORT_LONGLONG nums[5000];
+                long long nums[5000];
                 for (int i = 0; i < 33; i++) {
                     nums[i] = -5157318210846258176 + i;
                     int sz = ll2string(num, sizeof(num), nums[i]);
@@ -2537,7 +2636,7 @@ int quicklistTest(int argc, char *argv[]) {
                       options[_i]) {
                 quicklist *ql = quicklistNew(f, options[_i]);
                 char num[32];
-                PORT_LONGLONG nums[5000];
+                long long nums[5000];
                 for (int i = 0; i < 33; i++) {
                     nums[i] = -5157318210846258176 + i;
                     int sz = ll2string(num, sizeof(num), nums[i]);
@@ -2557,7 +2656,7 @@ int quicklistTest(int argc, char *argv[]) {
             TEST_DESC("create quicklist from ziplist at fill %d at compress %d",
                       f, options[_i]) {
                 unsigned char *zl = ziplistNew();
-                PORT_LONGLONG nums[64];
+                long long nums[64];
                 char num[64];
                 for (int i = 0; i < 33; i++) {
                     nums[i] = -5157318210846258176 + i;
@@ -2580,13 +2679,13 @@ int quicklistTest(int argc, char *argv[]) {
             }
         }
 
-        PORT_LONGLONG stop = mstime();
+        long long stop = mstime();
         runtime[_i] = stop - start;
     }
 
     /* Run a longer test of compression depth outside of primary test loop. */
     int list_sizes[] = {250, 251, 500, 999, 1000};
-    PORT_LONGLONG start = mstime();
+    long long start = mstime();
     for (int list = 0; list < (int)(sizeof(list_sizes) / sizeof(*list_sizes));
          list++) {
         for (int f = optimize_start; f < 128; f++) {
@@ -2631,7 +2730,7 @@ int quicklistTest(int argc, char *argv[]) {
             }
         }
     }
-    PORT_LONGLONG stop = mstime();
+    long long stop = mstime();
 
     printf("\n");
     for (size_t i = 0; i < option_count; i++)
@@ -2639,6 +2738,54 @@ int quicklistTest(int argc, char *argv[]) {
                (float)runtime[i] / 1000);
     printf("Compressions: %0.2f seconds.\n", (float)(stop - start) / 1000);
     printf("\n");
+
+    TEST("bookmark get updated to next item") {
+        quicklist *ql = quicklistNew(1, 0);
+        quicklistPushTail(ql, "1", 1);
+        quicklistPushTail(ql, "2", 1);
+        quicklistPushTail(ql, "3", 1);
+        quicklistPushTail(ql, "4", 1);
+        quicklistPushTail(ql, "5", 1);
+        assert(ql->len==5);
+        /* add two bookmarks, one pointing to the node before the last. */
+        assert(quicklistBookmarkCreate(&ql, "_dummy", ql->head->next));
+        assert(quicklistBookmarkCreate(&ql, "_test", ql->tail->prev));
+        /* test that the bookmark returns the right node, delete it and see that the bookmark points to the last node */
+        assert(quicklistBookmarkFind(ql, "_test") == ql->tail->prev);
+        assert(quicklistDelRange(ql, -2, 1));
+        assert(quicklistBookmarkFind(ql, "_test") == ql->tail);
+        /* delete the last node, and see that the bookmark was deleted. */
+        assert(quicklistDelRange(ql, -1, 1));
+        assert(quicklistBookmarkFind(ql, "_test") == NULL);
+        /* test that other bookmarks aren't affected */
+        assert(quicklistBookmarkFind(ql, "_dummy") == ql->head->next);
+        assert(quicklistBookmarkFind(ql, "_missing") == NULL);
+        assert(ql->len==3);
+        quicklistBookmarksClear(ql); /* for coverage */
+        assert(quicklistBookmarkFind(ql, "_dummy") == NULL);
+        quicklistRelease(ql);
+    }
+
+    TEST("bookmark limit") {
+        int i;
+        quicklist *ql = quicklistNew(1, 0);
+        quicklistPushHead(ql, "1", 1);
+        for (i=0; i<QL_MAX_BM; i++)
+            assert(quicklistBookmarkCreate(&ql, genstr("",i), ql->head));
+        /* when all bookmarks are used, creation fails */
+        assert(!quicklistBookmarkCreate(&ql, "_test", ql->head));
+        /* delete one and see that we can now create another */
+        assert(quicklistBookmarkDelete(ql, "0"));
+        assert(quicklistBookmarkCreate(&ql, "_test", ql->head));
+        /* delete one and see that the rest survive */
+        assert(quicklistBookmarkDelete(ql, "_test"));
+        for (i=1; i<QL_MAX_BM; i++)
+            assert(quicklistBookmarkFind(ql, genstr("",i)) == ql->head);
+        /* make sure the deleted ones are indeed gone */
+        assert(!quicklistBookmarkFind(ql, "0"));
+        assert(!quicklistBookmarkFind(ql, "_test"));
+        quicklistRelease(ql);
+    }
 
     if (!err)
         printf("ALL TESTS PASSED!\n");

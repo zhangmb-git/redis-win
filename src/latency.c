@@ -41,8 +41,8 @@ int dictStringKeyCompare(void *privdata, const void *key1, const void *key2) {
     return strcmp(key1,key2) == 0;
 }
 
-unsigned int dictStringHash(const void *key) {
-    return dictGenHashFunction(key, (int)strlen(key));                          WIN_PORT_FIX /* cast (int) */
+uint64_t dictStringHash(const void *key) {
+    return dictGenHashFunction(key, strlen(key));
 }
 
 void dictVanillaFree(void *privdata, void *val);
@@ -79,13 +79,13 @@ int THPIsEnabled(void) {
  * value of the function is non-zero, the process is being targeted by
  * THP support, and is likely to have memory usage / latency issues. */
 int THPGetAnonHugePagesSize(void) {
-    return (int)zmalloc_get_smap_bytes_by_field("AnonHugePages:");              WIN_PORT_FIX /* cast (int) */
+    return zmalloc_get_smap_bytes_by_field("AnonHugePages:",-1);
 }
 
 /* ---------------------------- Latency API --------------------------------- */
 
 /* Latency monitor initialization. We just need to create the dictionary
- * of time series, each time serie is craeted on demand in order to avoid
+ * of time series, each time serie is created on demand in order to avoid
  * having a fixed list to maintain. */
 void latencyMonitorInit(void) {
     server.latency_events = dictCreate(&latencyTimeSeriesDictType,NULL);
@@ -95,7 +95,7 @@ void latencyMonitorInit(void) {
  * This function is usually called via latencyAddSampleIfNeeded(), that
  * is a macro that only adds the sample if the latency is higher than
  * server.latency_monitor_threshold. */
-void latencyAddSample(char *event, mstime_t latency) {
+void latencyAddSample(const char *event, mstime_t latency) {
     struct latencyTimeSeries *ts = dictFetchValue(server.latency_events,event);
     time_t now = time(NULL);
     int prev;
@@ -109,18 +109,19 @@ void latencyAddSample(char *event, mstime_t latency) {
         dictAdd(server.latency_events,zstrdup(event),ts);
     }
 
+    if (latency > ts->max) ts->max = latency;
+
     /* If the previous sample is in the same second, we update our old sample
      * if this latency is > of the old one, or just return. */
     prev = (ts->idx + LATENCY_TS_LEN - 1) % LATENCY_TS_LEN;
     if (ts->samples[prev].time == now) {
         if (latency > ts->samples[prev].latency)
-            ts->samples[prev].latency = (int32_t)latency;                       WIN_PORT_FIX /* cast (int32_t) */
+            ts->samples[prev].latency = latency;
         return;
     }
 
-    ts->samples[ts->idx].time = (int32_t)time(NULL);                            WIN_PORT_FIX /* cast (int32_t) */
-    ts->samples[ts->idx].latency = (int32_t)latency;                            WIN_PORT_FIX /* cast (int32_t) */
-    if (latency > ts->max) ts->max = (int32_t)latency;                          WIN_PORT_FIX /* cast (int32_t) */
+    ts->samples[ts->idx].time = time(NULL);
+    ts->samples[ts->idx].latency = latency;
 
     ts->idx++;
     if (ts->idx == LATENCY_TS_LEN) ts->idx = 0;
@@ -151,7 +152,7 @@ int latencyResetEvent(char *event_to_reset) {
 
 /* ------------------------ Latency reporting (doctor) ---------------------- */
 
-/* Analyze the samples avaialble for a given event and return a structure
+/* Analyze the samples available for a given event and return a structure
  * populate with different metrics, average, MAD, min, max, and so forth.
  * Check latency.h definition of struct latenctStat for more info.
  * If the specified event has no elements the structure is populate with
@@ -194,7 +195,7 @@ void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
      * the oldest event time. We need to make the first an average and
      * the second a range of seconds. */
     if (ls->samples) {
-        ls->avg = (int32_t)(sum / ls->samples);                                 WIN_PORT_FIX /* cast (int32_t) */
+        ls->avg = sum / ls->samples;
         ls->period = time(NULL) - ls->period;
         if (ls->period == 0) ls->period = 1;
     }
@@ -209,7 +210,7 @@ void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
         if (delta < 0) delta = -delta;
         sum += delta;
     }
-    if (ls->samples) ls->mad = (int32_t)(sum / ls->samples);                    WIN_PORT_FIX /* cast (int32_t) */
+    if (ls->samples) ls->mad = sum / ls->samples;
 }
 
 /* Create a human readable report of latency events for this Redis instance. */
@@ -265,10 +266,10 @@ sds createLatencyReport(void) {
             "%d. %s: %d latency spikes (average %lums, mean deviation %lums, period %.2f sec). Worst all time event %lums.",
             eventnum, event,
             ls.samples,
-            (PORT_ULONG) ls.avg,
-            (PORT_ULONG) ls.mad,
+            (unsigned long) ls.avg,
+            (unsigned long) ls.mad,
             (double) ls.period/ls.samples,
-            (PORT_ULONG) ts->max);
+            (unsigned long) ts->max);
 
         /* Fork */
         if (!strcasecmp(event,"fork")) {
@@ -293,7 +294,7 @@ sds createLatencyReport(void) {
 
         /* Potentially commands. */
         if (!strcasecmp(event,"command")) {
-            if (server.slowlog_log_slower_than == 0) {
+            if (server.slowlog_log_slower_than < 0) {
                 advise_slowlog_enabled = 1;
                 advices++;
             } else if (server.slowlog_log_slower_than/1000 >
@@ -400,11 +401,11 @@ sds createLatencyReport(void) {
 
         /* Slow log. */
         if (advise_slowlog_enabled) {
-            report = sdscatprintf(report,"- There are latency issues with potentially slow commands you are using. Try to enable the Slow Log Redis feature using the command 'CONFIG SET slowlog-log-slower-than %llu'. If the Slow log is disabled Redis is not able to log slow commands execution for you.\n", (PORT_ULONGLONG)server.latency_monitor_threshold*1000);
+            report = sdscatprintf(report,"- There are latency issues with potentially slow commands you are using. Try to enable the Slow Log Redis feature using the command 'CONFIG SET slowlog-log-slower-than %llu'. If the Slow log is disabled Redis is not able to log slow commands execution for you.\n", (unsigned long long)server.latency_monitor_threshold*1000);
         }
 
         if (advise_slowlog_tuning) {
-            report = sdscatprintf(report,"- Your current Slow Log configuration only logs events that are slower than your configured latency monitor threshold. Please use 'CONFIG SET slowlog-log-slower-than %llu'.\n", (PORT_ULONGLONG)server.latency_monitor_threshold*1000);
+            report = sdscatprintf(report,"- Your current Slow Log configuration only logs events that are slower than your configured latency monitor threshold. Please use 'CONFIG SET slowlog-log-slower-than %llu'.\n", (unsigned long long)server.latency_monitor_threshold*1000);
         }
 
         if (advise_slowlog_inspect) {
@@ -475,19 +476,19 @@ sds createLatencyReport(void) {
 /* latencyCommand() helper to produce a time-delay reply for all the samples
  * in memory for the specified time series. */
 void latencyCommandReplyWithSamples(client *c, struct latencyTimeSeries *ts) {
-    void *replylen = addDeferredMultiBulkLength(c);
+    void *replylen = addReplyDeferredLen(c);
     int samples = 0, j;
 
     for (j = 0; j < LATENCY_TS_LEN; j++) {
         int i = (ts->idx + j) % LATENCY_TS_LEN;
 
         if (ts->samples[i].time == 0) continue;
-        addReplyMultiBulkLen(c,2);
+        addReplyArrayLen(c,2);
         addReplyLongLong(c,ts->samples[i].time);
         addReplyLongLong(c,ts->samples[i].latency);
         samples++;
     }
-    setDeferredMultiBulkLength(c,replylen,samples);
+    setDeferredArrayLen(c,replylen,samples);
 }
 
 /* latencyCommand() helper to produce the reply for the LATEST subcommand,
@@ -496,14 +497,14 @@ void latencyCommandReplyWithLatestEvents(client *c) {
     dictIterator *di;
     dictEntry *de;
 
-    addReplyMultiBulkLen(c,dictSize(server.latency_events));
+    addReplyArrayLen(c,dictSize(server.latency_events));
     di = dictGetIterator(server.latency_events);
     while((de = dictNext(di)) != NULL) {
         char *event = dictGetKey(de);
         struct latencyTimeSeries *ts = dictGetVal(de);
         int last = (ts->idx + LATENCY_TS_LEN - 1) % LATENCY_TS_LEN;
 
-        addReplyMultiBulkLen(c,4);
+        addReplyArrayLen(c,4);
         addReplyBulkCString(c,event);
         addReplyLongLong(c,ts->samples[last].time);
         addReplyLongLong(c,ts->samples[last].latency);
@@ -534,7 +535,7 @@ sds latencyCommandGenSparkeline(char *event, struct latencyTimeSeries *ts) {
         }
         /* Use as label the number of seconds / minutes / hours / days
          * ago the event happened. */
-        elapsed = (int)(time(NULL) - ts->samples[i].time);                      WIN_PORT_FIX /* cast (int) */
+        elapsed = time(NULL) - ts->samples[i].time;
         if (elapsed < 60)
             snprintf(buf,sizeof(buf),"%ds",elapsed);
         else if (elapsed < 3600)
@@ -547,8 +548,8 @@ sds latencyCommandGenSparkeline(char *event, struct latencyTimeSeries *ts) {
     }
 
     graph = sdscatprintf(graph,
-        "%s - high %Iu ms, low %Iu ms (all time high %Iu ms)\n", event,         WIN_PORT_FIX /* %ld -> %Id, %lu -> %Iu */
-        (PORT_ULONG) max, (PORT_ULONG) min, (PORT_ULONG) ts->max);
+        "%s - high %lu ms, low %lu ms (all time high %lu ms)\n", event,
+        (unsigned long) max, (unsigned long) min, (unsigned long) ts->max);
     for (j = 0; j < LATENCY_GRAPH_COLS; j++)
         graph = sdscatlen(graph,"-",1);
     graph = sdscatlen(graph,"\n",1);
@@ -559,19 +560,30 @@ sds latencyCommandGenSparkeline(char *event, struct latencyTimeSeries *ts) {
 
 /* LATENCY command implementations.
  *
- * LATENCY SAMPLES: return time-latency samples for the specified event.
+ * LATENCY HISTORY: return time-latency samples for the specified event.
  * LATENCY LATEST: return the latest latency for all the events classes.
- * LATENCY DOCTOR: returns an human readable analysis of instance latency.
+ * LATENCY DOCTOR: returns a human readable analysis of instance latency.
  * LATENCY GRAPH: provide an ASCII graph of the latency of the specified event.
+ * LATENCY RESET: reset data of a specified event or all the data if no event provided.
  */
 void latencyCommand(client *c) {
+    const char *help[] = {
+"DOCTOR              -- Returns a human readable latency analysis report.",
+"GRAPH   <event>     -- Returns an ASCII latency graph for the event class.",
+"HISTORY <event>     -- Returns time-latency samples for the event class.",
+"LATEST              -- Returns the latest latency samples for all events.",
+"RESET   [event ...] -- Resets latency data of one or more event classes.",
+"                       (default: reset all data for all event classes)",
+"HELP                -- Prints this help.",
+NULL
+    };
     struct latencyTimeSeries *ts;
 
     if (!strcasecmp(c->argv[1]->ptr,"history") && c->argc == 3) {
         /* LATENCY HISTORY <event> */
         ts = dictFetchValue(server.latency_events,c->argv[2]->ptr);
         if (ts == NULL) {
-            addReplyMultiBulkLen(c,0);
+            addReplyArrayLen(c,0);
         } else {
             latencyCommandReplyWithSamples(c,ts);
         }
@@ -587,7 +599,7 @@ void latencyCommand(client *c) {
         event = dictGetKey(de);
 
         graph = latencyCommandGenSparkeline(event,ts);
-        addReplyBulkCString(c,graph);
+        addReplyVerbatim(c,graph,sdslen(graph),"txt");
         sdsfree(graph);
     } else if (!strcasecmp(c->argv[1]->ptr,"latest") && c->argc == 2) {
         /* LATENCY LATEST */
@@ -596,7 +608,7 @@ void latencyCommand(client *c) {
         /* LATENCY DOCTOR */
         sds report = createLatencyReport();
 
-        addReplyBulkCBuffer(c,report,sdslen(report));
+        addReplyVerbatim(c,report,sdslen(report),"txt");
         sdsfree(report);
     } else if (!strcasecmp(c->argv[1]->ptr,"reset") && c->argc >= 2) {
         /* LATENCY RESET */
@@ -609,8 +621,10 @@ void latencyCommand(client *c) {
                 resets += latencyResetEvent(c->argv[j]->ptr);
             addReplyLongLong(c,resets);
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"help") && c->argc == 2) {
+        addReplyHelp(c, help);
     } else {
-        addReply(c,shared.syntaxerr);
+        addReplySubcommandSyntaxError(c);
     }
     return;
 

@@ -35,6 +35,8 @@
 void initClientMultiState(client *c) {
     c->mstate.commands = NULL;
     c->mstate.count = 0;
+    c->mstate.cmd_flags = 0;
+    c->mstate.cmd_inv_flags = 0;
 }
 
 /* Release all the resources associated with MULTI/EXEC state */
@@ -57,6 +59,13 @@ void queueMultiCommand(client *c) {
     multiCmd *mc;
     int j;
 
+    /* No sense to waste memory if the transaction is already aborted.
+     * this is useful in case client sends these in a pipeline, or doesn't
+     * bother to read previous responses and didn't notice the multi was already
+     * aborted. */
+    if (c->flags & CLIENT_DIRTY_EXEC)
+        return;
+
     c->mstate.commands = zrealloc(c->mstate.commands,
             sizeof(multiCmd)*(c->mstate.count+1));
     mc = c->mstate.commands+c->mstate.count;
@@ -67,6 +76,8 @@ void queueMultiCommand(client *c) {
     for (j = 0; j < c->argc; j++)
         incrRefCount(mc->argv[j]);
     c->mstate.count++;
+    c->mstate.cmd_flags |= c->cmd->flags;
+    c->mstate.cmd_inv_flags |= ~c->cmd->flags;
 }
 
 void discardTransaction(client *c) {
@@ -104,11 +115,30 @@ void discardCommand(client *c) {
 /* Send a MULTI command to all the slaves and AOF file. Check the execCommand
  * implementation for more information. */
 void execCommandPropagateMulti(client *c) {
-    robj *multistring = createStringObject("MULTI",5);
-
-    propagate(server.multiCommand,c->db->id,&multistring,1,
+    propagate(server.multiCommand,c->db->id,&shared.multi,1,
               PROPAGATE_AOF|PROPAGATE_REPL);
-    decrRefCount(multistring);
+}
+
+void execCommandPropagateExec(client *c) {
+    propagate(server.execCommand,c->db->id,&shared.exec,1,
+              PROPAGATE_AOF|PROPAGATE_REPL);
+}
+
+/* Aborts a transaction, with a specific error message.
+ * The transaction is always aboarted with -EXECABORT so that the client knows
+ * the server exited the multi state, but the actual reason for the abort is
+ * included too. */
+void execCommandAbort(client *c, sds error) {
+    discardTransaction(c);
+
+    if (error[0] == '-') error++;
+    addReplyErrorFormat(c, "-EXECABORT Transaction discarded because of: %s", error);
+
+    /* Send EXEC to clients waiting data from MONITOR. We did send a MULTI
+     * already, and didn't send any of the queued commands, now we'll just send
+     * EXEC so it is clear that the transaction is over. */
+    if (listLength(server.monitors) && !server.loading)
+        replicationFeedMonitors(c,server.monitors,c->db->id,c->argv,c->argc);
 }
 
 void execCommand(client *c) {
@@ -117,6 +147,7 @@ void execCommand(client *c) {
     int orig_argc;
     struct redisCommand *orig_cmd;
     int must_propagate = 0; /* Need to propagate MULTI/EXEC to AOF / slaves? */
+    int was_master = server.masterhost == NULL;
 
     if (!(c->flags & CLIENT_MULTI)) {
         addReplyError(c,"EXEC without MULTI");
@@ -131,7 +162,7 @@ void execCommand(client *c) {
      * in the second an EXECABORT error is returned. */
     if (c->flags & (CLIENT_DIRTY_CAS|CLIENT_DIRTY_EXEC)) {
         addReply(c, c->flags & CLIENT_DIRTY_EXEC ? shared.execaborterr :
-                                                  shared.nullmultibulk);
+                                                   shared.nullarray[c->resp]);
         discardTransaction(c);
         goto handle_monitor;
     }
@@ -141,22 +172,40 @@ void execCommand(client *c) {
     orig_argv = c->argv;
     orig_argc = c->argc;
     orig_cmd = c->cmd;
-    addReplyMultiBulkLen(c,c->mstate.count);
+    addReplyArrayLen(c,c->mstate.count);
     for (j = 0; j < c->mstate.count; j++) {
         c->argc = c->mstate.commands[j].argc;
         c->argv = c->mstate.commands[j].argv;
         c->cmd = c->mstate.commands[j].cmd;
 
-        /* Propagate a MULTI request once we encounter the first write op.
+        /* Propagate a MULTI request once we encounter the first command which
+         * is not readonly nor an administrative one.
          * This way we'll deliver the MULTI/..../EXEC block as a whole and
          * both the AOF and the replication link will have the same consistency
          * and atomicity guarantees. */
-        if (!must_propagate && !(c->cmd->flags & CMD_READONLY)) {
+        if (!must_propagate &&
+            !server.loading &&
+            !(c->cmd->flags & (CMD_READONLY|CMD_ADMIN)))
+        {
             execCommandPropagateMulti(c);
             must_propagate = 1;
         }
 
-        call(c,CMD_CALL_FULL);
+        int acl_keypos;
+        int acl_retval = ACLCheckCommandPerm(c,&acl_keypos);
+        if (acl_retval != ACL_OK) {
+            addACLLogEntry(c,acl_retval,acl_keypos,NULL);
+            addReplyErrorFormat(c,
+                "-NOPERM ACLs rules changed between the moment the "
+                "transaction was accumulated and the EXEC call. "
+                "This command is no longer allowed for the "
+                "following reason: %s",
+                (acl_retval == ACL_DENIED_CMD) ?
+                "no permission to execute the command or subcommand" :
+                "no permission to touch the specified keys");
+        } else {
+            call(c,server.loading ? CMD_CALL_NONE : CMD_CALL_FULL);
+        }
 
         /* Commands may alter argc/argv, restore mstate. */
         c->mstate.commands[j].argc = c->argc;
@@ -167,9 +216,22 @@ void execCommand(client *c) {
     c->argc = orig_argc;
     c->cmd = orig_cmd;
     discardTransaction(c);
+
     /* Make sure the EXEC command will be propagated as well if MULTI
      * was already propagated. */
-    if (must_propagate) server.dirty++;
+    if (must_propagate) {
+        int is_master = server.masterhost == NULL;
+        server.dirty++;
+        /* If inside the MULTI/EXEC block this instance was suddenly
+         * switched from master to slave (using the SLAVEOF command), the
+         * initial MULTI was propagated into the replication backlog, but the
+         * rest was not. We need to make sure to at least terminate the
+         * backlog with the final EXEC. */
+        if (server.repl_backlog && was_master && !is_master) {
+            char *execcmd = "*1\r\n$4\r\nEXEC\r\n";
+            feedReplicationBacklog(execcmd,strlen(execcmd));
+        }
+    }
 
 handle_monitor:
     /* Send EXEC to clients waiting data from MONITOR. We do it here
